@@ -1,6 +1,6 @@
 // Package main implements the arkilian-local binary.
 // This binary runs all services (ingest, query, compact) in a single process
-// without network ports, designed for local development and simple use cases.
+// with a PostgreSQL-like single port interface, designed for local development.
 package main
 
 import (
@@ -25,12 +25,16 @@ func main() {
 	var (
 		configFile string
 		dataDir    string
+		httpAddr   string
+		grpcAddr   string
 		showVersion bool
 		showHelp   bool
 	)
 
 	flag.StringVar(&configFile, "config", "", "Path to configuration file (YAML or JSON)")
 	flag.StringVar(&dataDir, "data-dir", "", "Base directory for all data files")
+	flag.StringVar(&httpAddr, "http-addr", "", "HTTP server address (default: :5432, like PostgreSQL)")
+	flag.StringVar(&grpcAddr, "grpc-addr", "", "gRPC server address (default: :5433)")
 	flag.BoolVar(&showVersion, "version", false, "Show version information")
 	flag.BoolVar(&showHelp, "help", false, "Show help message")
 
@@ -41,9 +45,12 @@ func main() {
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  arkilian-local --data-dir /data/arkilian\n")
-		fmt.Fprintf(os.Stderr, "  arkilian-local --config /etc/arkilian/config.yaml\n")
+		fmt.Fprintf(os.Stderr, "  arkilian-local --http-addr :5432 --data-dir /data/arkilian\n")
+		fmt.Fprintf(os.Stderr, "  arkilian-local --config config-local.yaml\n")
 		fmt.Fprintf(os.Stderr, "\nEnvironment Variables:\n")
 		fmt.Fprintf(os.Stderr, "  ARKILIAN_DATA_DIR       Base directory for data files\n")
+		fmt.Fprintf(os.Stderr, "  ARKILIAN_HTTP_ADDR      HTTP server address (default: :5432)\n")
+		fmt.Fprintf(os.Stderr, "  ARKILIAN_GRPC_ADDR      gRPC server address (default: :5433)\n")
 	}
 
 	flag.Parse()
@@ -59,7 +66,7 @@ func main() {
 	}
 
 	// Load configuration
-	cfg, err := loadConfig(configFile, dataDir)
+	cfg, err := loadConfig(configFile, dataDir, httpAddr, grpcAddr)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
@@ -94,7 +101,7 @@ func main() {
 }
 
 // loadConfig loads configuration from file, environment, and command line flags.
-func loadConfig(configFile, dataDir string) (*config.Config, error) {
+func loadConfig(configFile, dataDir, httpAddr, grpcAddr string) (*config.Config, error) {
 	var cfg *config.Config
 	var err error
 
@@ -115,10 +122,32 @@ func loadConfig(configFile, dataDir string) (*config.Config, error) {
 	if dataDir != "" {
 		cfg.DataDir = dataDir
 	}
+	if httpAddr != "" {
+		cfg.HTTP.IngestAddr = httpAddr
+		cfg.HTTP.QueryAddr = httpAddr
+		cfg.HTTP.CompactAddr = httpAddr
+	}
+	if grpcAddr != "" {
+		cfg.GRPC.Addr = grpcAddr
+	}
 
-	// For local mode, disable gRPC and set all services to run
-	cfg.GRPC.Enabled = false
+	// For local mode, set all services to run
 	cfg.Mode = config.ModeAll
+
+	// Set PostgreSQL-like default ports for local mode if not already set
+	// This provides a familiar experience for developers coming from PostgreSQL
+	if cfg.HTTP.IngestAddr == ":8080" {
+		cfg.HTTP.IngestAddr = ":5432"
+	}
+	if cfg.HTTP.QueryAddr == ":8081" {
+		cfg.HTTP.QueryAddr = ":5432"
+	}
+	if cfg.HTTP.CompactAddr == ":8082" {
+		cfg.HTTP.CompactAddr = ":5432"
+	}
+	if cfg.GRPC.Addr == ":9090" {
+		cfg.GRPC.Addr = ":5433"
+	}
 
 	return cfg, nil
 }
@@ -135,12 +164,15 @@ func printBanner(cfg *config.Config) {
 	log.Printf("  Data Dir: %s", cfg.DataDir)
 	log.Printf("  Storage:  %s", cfg.Storage.Type)
 	log.Printf("")
-	log.Printf("Services (all running in-process, no network ports):")
-	log.Printf("  ✓ Ingest Service")
-	log.Printf("  ✓ Query Service")
-	log.Printf("  ✓ Compaction Service")
+	log.Printf("Services (all running in single process):")
+	log.Printf("  ✓ Ingest Service: %s", cfg.HTTP.IngestAddr)
+	log.Printf("  ✓ Query Service: %s", cfg.HTTP.QueryAddr)
+	log.Printf("  ✓ Compaction Service: %s", cfg.HTTP.CompactAddr)
+	if cfg.GRPC.Enabled {
+		log.Printf("  ✓ gRPC Service: %s", cfg.GRPC.Addr)
+	}
 	log.Printf("")
-	log.Printf("To use this database, connect your application directly to the")
-	log.Printf("data directory: %s", cfg.DataDir)
+	log.Printf("To use this database, connect your application to the HTTP endpoints above.")
+	log.Printf("Data directory: %s", cfg.DataDir)
 	log.Printf("")
 }

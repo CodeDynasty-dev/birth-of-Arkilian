@@ -1,6 +1,6 @@
 module github.com/arkilian/arkilian
 
-go 1.24.0
+go 1.24.2
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.1
@@ -37,6 +37,7 @@ require (
 	github.com/aws/smithy-go v1.24.0 // indirect
 	github.com/bits-and-blooms/bitset v1.2.0 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
@@ -54,6 +55,7 @@ require (
 	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/vkudryk/rapidhash-go v0.0.0-20250522125531-a03e5539e1bf // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
 	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect

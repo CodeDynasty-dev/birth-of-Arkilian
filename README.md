@@ -130,23 +130,28 @@ go test -v -bench=BenchmarkProd -run=TestProd -benchtime=2x -timeout=300s ./test
 ./arkilian --mode compact --data-dir /data/arkilian
 ```
 
-### Local-Only Mode (No Ports)
+### Local-Only Mode (PostgreSQL-like Ports)
 
-For local development and simple use cases, use `arkilian-local` which runs all services in a single process without network ports:
+For local development and simple use cases, use `arkilian-local` which runs all services in a single process with PostgreSQL-like default ports:
 
 ```bash
-# Run local mode (all services, no network ports)
+# Run local mode (all services, PostgreSQL-like ports)
 ./arkilian-local --data-dir /data/arkilian-local
 
 # Or with a config file
 ./arkilian-local --config config-local.yaml
 ```
 
+**Default ports (PostgreSQL-like):**
+- HTTP Ingest: `:5432` (like PostgreSQL's default port)
+- HTTP Query: `:5432` (same as ingest for unified experience)
+- HTTP Compaction: `:5432` (same as ingest for unified experience)
+- gRPC: `:5433` (alternative port for gRPC)
+
 **Key differences from the main binary:**
 
-- No HTTP ports (8080, 8081, 8082)
-- No gRPC server
-- All services run in-process
+- PostgreSQL-like default ports (5432 for HTTP, 5433 for gRPC)
+- All services run in a single process
 - Simpler configuration
 - Perfect for local development and testing
 
@@ -164,6 +169,9 @@ For local development and simple use cases, use `arkilian-local` which runs all 
 - Multi-node clusters
 - When you need HTTP/gRPC APIs
 - When you need to run services separately
+- When you need to expose the database to other services
+
+**Note:** When using `arkilian-local` with default settings, all HTTP services share the same port (`:5432`). This provides a unified experience similar to PostgreSQL. If you need to run services on different ports, you can override the ports using the `--http-addr` flag or environment variables.
 - When you need to expose the database to other services
 
 ## API

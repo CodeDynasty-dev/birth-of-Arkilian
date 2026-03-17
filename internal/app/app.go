@@ -61,6 +61,9 @@ type App struct {
 	// Materializer for JSON column materialization
 	materializer *schema.Materializer
 
+	// Single HTTP server for local mode (all services on one port)
+	singleHTTPServer *http.Server
+
 	// Lifecycle
 	mu      sync.Mutex
 	running bool
@@ -105,7 +108,22 @@ func (a *App) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize shared resources: %w", err)
 	}
 
+	// Check if we should use single HTTP server (all services on same port)
+	// This is the case for arkilian-local with default ports
+	useSingleServer := a.cfg.HTTP.IngestAddr == a.cfg.HTTP.QueryAddr &&
+		a.cfg.HTTP.QueryAddr == a.cfg.HTTP.CompactAddr
+
+	if useSingleServer {
+		// Start single HTTP server for all services
+		if err := a.startSingleHTTPServer(ctx); err != nil {
+			a.cleanup()
+			return fmt.Errorf("failed to start single HTTP server: %w", err)
+		}
+	}
+
 	// Start services based on mode
+	// Note: When using single HTTP server, the individual services still run
+	// but don't start their own HTTP servers (they check for singleHTTPServer)
 	if a.cfg.ShouldRunIngest() {
 		if err := a.startIngestService(ctx); err != nil {
 			a.cleanup()
@@ -287,23 +305,26 @@ func (a *App) startIngestService(ctx context.Context) error {
 	mux.Handle("/v1/ingest", middleware(ingestHandler))
 	mux.HandleFunc("/health", a.healthHandler("arkilian-ingest"))
 
-	a.ingestServer = &http.Server{
-		Addr:         a.cfg.HTTP.IngestAddr,
-		Handler:      mux,
-		ReadTimeout:  a.cfg.HTTP.ReadTimeout,
-		WriteTimeout: a.cfg.HTTP.WriteTimeout,
-		IdleTimeout:  a.cfg.HTTP.IdleTimeout,
-	}
-
-	// Start HTTP server
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		log.Printf("Ingest HTTP server listening on %s", a.cfg.HTTP.IngestAddr)
-		if err := a.ingestServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Ingest HTTP server error: %v", err)
+	// Only start individual HTTP server if not using single server mode
+	if a.singleHTTPServer == nil {
+		a.ingestServer = &http.Server{
+			Addr:         a.cfg.HTTP.IngestAddr,
+			Handler:      mux,
+			ReadTimeout:  a.cfg.HTTP.ReadTimeout,
+			WriteTimeout: a.cfg.HTTP.WriteTimeout,
+			IdleTimeout:  a.cfg.HTTP.IdleTimeout,
 		}
-	}()
+
+		// Start HTTP server
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			log.Printf("Ingest HTTP server listening on %s", a.cfg.HTTP.IngestAddr)
+			if err := a.ingestServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("Ingest HTTP server error: %v", err)
+			}
+		}()
+	}
 
 	// Start gRPC server if enabled
 	if a.cfg.GRPC.Enabled {
@@ -418,23 +439,26 @@ func (a *App) startQueryService(ctx context.Context) error {
 	mux.Handle("/v1/query", middleware(queryHandler))
 	mux.HandleFunc("/health", a.healthHandler("arkilian-query"))
 
-	a.queryServer = &http.Server{
-		Addr:         a.cfg.HTTP.QueryAddr,
-		Handler:      mux,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
-
-	// Start HTTP server
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		log.Printf("Query HTTP server listening on %s", a.cfg.HTTP.QueryAddr)
-		if err := a.queryServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Query HTTP server error: %v", err)
+	// Only start individual HTTP server if not using single server mode
+	if a.singleHTTPServer == nil {
+		a.queryServer = &http.Server{
+			Addr:         a.cfg.HTTP.QueryAddr,
+			Handler:      mux,
+			ReadTimeout:  60 * time.Second,
+			WriteTimeout: 120 * time.Second,
+			IdleTimeout:  120 * time.Second,
 		}
-	}()
+
+		// Start HTTP server
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			log.Printf("Query HTTP server listening on %s", a.cfg.HTTP.QueryAddr)
+			if err := a.queryServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("Query HTTP server error: %v", err)
+			}
+		}()
+	}
 
 	return nil
 }
@@ -491,23 +515,26 @@ func (a *App) startCompactService(ctx context.Context) error {
 	mux.HandleFunc("/health", a.healthHandler("arkilian-compact"))
 	mux.HandleFunc("/trigger", a.triggerHandler())
 
-	a.compactServer = &http.Server{
-		Addr:         a.cfg.HTTP.CompactAddr,
-		Handler:      mux,
-		ReadTimeout:  a.cfg.HTTP.ReadTimeout,
-		WriteTimeout: a.cfg.HTTP.WriteTimeout,
-		IdleTimeout:  a.cfg.HTTP.IdleTimeout,
-	}
-
-	// Start HTTP server
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		log.Printf("Compaction HTTP server listening on %s", a.cfg.HTTP.CompactAddr)
-		if err := a.compactServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Compaction HTTP server error: %v", err)
+	// Only start individual HTTP server if not using single server mode
+	if a.singleHTTPServer == nil {
+		a.compactServer = &http.Server{
+			Addr:         a.cfg.HTTP.CompactAddr,
+			Handler:      mux,
+			ReadTimeout:  a.cfg.HTTP.ReadTimeout,
+			WriteTimeout: a.cfg.HTTP.WriteTimeout,
+			IdleTimeout:  a.cfg.HTTP.IdleTimeout,
 		}
-	}()
+
+		// Start HTTP server
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			log.Printf("Compaction HTTP server listening on %s", a.cfg.HTTP.CompactAddr)
+			if err := a.compactServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("Compaction HTTP server error: %v", err)
+			}
+		}()
+	}
 
 	// Start compaction daemon
 	if err := a.compactDaemon.Start(ctx); err != nil {
@@ -594,6 +621,13 @@ func (a *App) Stop(ctx context.Context) error {
 	// Shutdown HTTP servers
 	shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+
+	// Shutdown single HTTP server if it exists
+	if a.singleHTTPServer != nil {
+		if err := a.singleHTTPServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Single HTTP server shutdown error: %v", err)
+		}
+	}
 
 	if a.ingestServer != nil {
 		if err := a.ingestServer.Shutdown(shutdownCtx); err != nil {
@@ -731,6 +765,69 @@ func (a *App) triggerHandler() http.HandlerFunc {
 		w.WriteHeader(http.StatusAccepted)
 		fmt.Fprintf(w, `{"status":"accepted","message":"Compaction triggered for partition_key=%s"}`, partitionKey)
 	}
+}
+
+// startSingleHTTPServer starts a single HTTP server that handles all services.
+// This is used by arkilian-local to provide a unified port experience.
+func (a *App) startSingleHTTPServer(ctx context.Context) error {
+	mux := http.NewServeMux()
+	middleware := httpapi.ChainMiddleware(
+		server.ShutdownMiddleware(a.shutdown),
+		httpapi.RecoveryMiddleware,
+		httpapi.RequestIDMiddleware,
+		httpapi.CorrelationIDMiddleware,
+		httpapi.ContentTypeMiddleware,
+	)
+
+	// Create handlers for each service
+	var ingestHandler http.Handler
+	var queryHandler http.Handler
+	var compactHandler http.Handler
+
+	if a.cfg.ShouldRunIngest() {
+		builder := partition.NewBuilder(a.cfg.Ingest.PartitionDir, a.cfg.Ingest.TargetPartitionSizeMB)
+		metaGen := partition.NewMetadataGenerator()
+		ingestHandler = middleware(httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage, a.walInstance, a.materializer))
+		mux.Handle("/v1/ingest", ingestHandler)
+	}
+
+	if a.cfg.ShouldRunQuery() {
+		queryHandler = middleware(httpapi.NewQueryHandler(a.queryExecutor, nil))
+		mux.Handle("/v1/query", queryHandler)
+	}
+
+	if a.cfg.ShouldRunCompact() {
+		compactHandler = middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/trigger" {
+				a.triggerHandler()(w, r)
+				return
+			}
+			a.healthHandler("arkilian-compact")(w, r)
+		}))
+		mux.Handle("/trigger", compactHandler)
+	}
+
+	// Add health handler (only once)
+	mux.HandleFunc("/health", a.healthHandler("arkilian-local"))
+
+	a.singleHTTPServer = &http.Server{
+		Addr:         a.cfg.HTTP.IngestAddr,
+		Handler:      mux,
+		ReadTimeout:  a.cfg.HTTP.ReadTimeout,
+		WriteTimeout: a.cfg.HTTP.WriteTimeout,
+		IdleTimeout:  a.cfg.HTTP.IdleTimeout,
+	}
+
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		log.Printf("Single HTTP server listening on %s", a.cfg.HTTP.IngestAddr)
+		if err := a.singleHTTPServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("Single HTTP server error: %v", err)
+		}
+	}()
+
+	return nil
 }
 
 // WaitForShutdown blocks until a shutdown signal is received.
