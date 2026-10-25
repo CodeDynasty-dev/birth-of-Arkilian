@@ -738,7 +738,14 @@ int main(void) {
   RUN_TEST(test_keyless_table_skipped);
 
   printf("\n[Dead-Letter Hygiene]\n");
+#ifndef _WIN32
   RUN_TEST(test_dead_letter_zombie_cleared);
+#else
+  // Needs the in-process S3 mock (ark_stub_s3.h), which is POSIX-only.
+  // Without it the startup manifest read never resolves, shipping stays
+  // gated (by design since 1.6.0), and the dead-letter pass never runs.
+  printf("  SKIP test_dead_letter_zombie_cleared (no S3 mock on Windows)\n");
+#endif
 
   printf("\n[Schema Desync Detection]\n");
   RUN_TEST(test_ddl_via_raw_handle_flags_dirty);
