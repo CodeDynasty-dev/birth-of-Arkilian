@@ -45,6 +45,10 @@ covered by `tests/test_p0_replication.c` (or an updated existing suite).
   the manifest. `db_close()` now drains the whole outbox in full chunks within
   `ARKILIAN_SHUTDOWN_DRAIN_SEC` (default 10 s) and publishes immediately
   (found by the end-to-end benchmark: a large final backlog was cut short).
+- The outbox cap could be exceeded under load in an earlier 1.6 build: the
+  flush thread cleared the outbox-full flag at 90% while the guard raised it
+  lower, so it could undo a fresh raise. The clear point is now derived from
+  the guard's headroom (capture was never lost; only the cap overshot).
 - Shipping waits for the startup manifest read, so adopted and new chunk
   records stay in LSN order; an endpoint refused by the SSRF guard is reported
   at startup.
@@ -53,25 +57,32 @@ covered by `tests/test_p0_replication.c` (or an updated existing suite).
 
 ### Performance
 
-Measured on the same machine against raw SQLite with prepared statements
-(`bench/bench_cmp.c`, `synchronous=NORMAL`, median of 3):
+Measured with `bench/bench_cmp.c` (raw SQLite vs Arkilian, prepared
+statements, identical pragmas, median of 3). On a MacBook (i7-9750H),
+default `synchronous=FULL`:
 
-| Workload | 1.5.0 | 1.6.0 |
-| --- | --- | --- |
-| Single-row INSERT (autocommit) | 7.3x slower than SQLite | 3.2x |
-| INSERT, 1000 rows per transaction | 57x | 12.5x |
-| UPDATE by primary key (autocommit) | 4.6x | 2.5x |
-| Point SELECT | 1.1x | 1.1x |
+| Workload | SQLite | Arkilian 1.6.0 | Slower by |
+| --- | --- | --- | --- |
+| INSERT, one row per transaction | 7,080/s | 5,262/s | 1.35x |
+| UPDATE, one row per transaction | 18,202/s | 12,017/s | 1.5x |
+| INSERT, 1000 rows per transaction | 554,109 rows/s | 63,927 rows/s | 8.7x |
+| Point SELECT | 233,467/s | 221,128/s | 1.06x |
+
+On a Linux VM against 1.5.0 (`synchronous=NORMAL`): single-row INSERT went
+from 7.3x to 3.2x slower than SQLite, UPDATE from 4.6x to 2.5x, 1000-row
+transactions from 57x to 12.5x. On the MacBook with `synchronous=NORMAL`:
+INSERT 2.8x, UPDATE 2.1x, 1000-row transactions 9.8x slower than SQLite.
 
 - The flush thread is no longer woken on every changed row (the update hook
   fired per row, before commit, so the thread spun on empty drains in
   lock-step with the writer). Wake-ups are coalesced to at most one per
   100 ms and the thread polls every 100 ms while writes flow.
 - The outbox cap is no longer measured on every captured row. A guard
-  trigger on the outbox checks occupancy every M-th row (M = min(256,
-  cap/4)) with M rows of headroom, so the cap stays exact while capture
-  triggers test a single flag row; overflow still records a capture gap in
-  the same transaction (or fails the write in strict mode).
+  statement at the end of each capture trigger checks occupancy on a small
+  fraction of rows with enough headroom that the cap is never exceeded
+  (proved by a mixed-workload test that checks after every operation);
+  capture triggers test a single flag row. Overflow still records a capture
+  gap in the same transaction, or fails the write in strict mode.
 - Write cost no longer grows with the unshipped backlog (1.5.0 ran a
   `COUNT(*)` over the outbox per row: about 10x slower at 90k pending rows).
 - The `created_at` outbox index is dropped from the capture hot path.
@@ -87,6 +98,8 @@ Measured on the same machine against raw SQLite with prepared statements
   publish, restore with byte-level verification, and a storage outage.
 - A data race in the `test_kill_resilience` mock server (read while its
   thread was still recording) is fixed.
+- `src/class.c` compiles warning-free under GCC and Clang at `-O2` and `-O3`
+  with `-Werror` (the Node addon builds with `-O3 -Werror`).
 
 - The documented default build works on a fresh clone (the example target
   pointed at a missing `examples/main.c`).

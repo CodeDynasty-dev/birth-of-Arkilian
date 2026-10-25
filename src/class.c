@@ -439,6 +439,7 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
                                     uint64_t publish_upto);
 static void manifest_registry_maybe_upload(arkilian *db);
 static void manifest_registry_publish(arkilian *db, int force);
+static long outbox_guard_headroom(long cap);
 static int snapshot_upload_and_publish(arkilian *db, const char *stage,
                                        uint64_t snapshot_upto,
                                        const char *gap_at_copy);
@@ -579,9 +580,10 @@ static int read_gap_and_seq(sqlite3 *h, char *gap_out, size_t gap_cap,
 }
 
 // Outbox-full flag maintenance on the flush thread. The flag is RAISED
-// inside application transactions by the arkguard_outbox_cap trigger
-// (exact cap); this clears it once the outbox drains below 90% of the
-// cap, and raises it as a safety net if the outbox is ever found at cap.
+// inside application transactions by the capture triggers' guard statement
+// (exact cap); this clears it once the outbox has drained a further guard
+// headroom below the raise point (never undoing a fresh raise), and raises
+// it as a safety net if the outbox is ever found at cap.
 static void update_outbox_full_flag(arkilian *db) {
   if (!db || !db->backup_db) return;
   sqlite3_stmt *st = NULL;
@@ -596,7 +598,8 @@ static void update_outbox_full_flag(arkilian *db) {
   sqlite3_finalize(st);
   if (span < 0) return;
   long cap = outbox_cap();
-  long low = cap >= 10 ? cap - cap / 10 : cap;
+  long low = cap - 2 * outbox_guard_headroom(cap);
+  if (low < 0) low = 0;
   if (!flagged && span >= cap) {
     sqlite3_exec(db->backup_db,
                  "INSERT OR IGNORE INTO _arkilian_meta (k, v) VALUES ('outbox_full', '1');",
@@ -1821,6 +1824,50 @@ static int is_reserved_table(const char *name) {
   return 0;
 }
 
+// Guard statement appended to every capture trigger (and run after a DDL
+// capture). Inside a trigger, last_insert_rowid() is the outbox row just
+// written, and outbox ids are consecutive.
+//  - Small caps (M < 3): every capture is checked; the flag is raised once
+//    the outbox holds `cap` rows, so single-row captures fill it exactly.
+//  - Larger caps: a capture is checked when its last outbox id falls on
+//    residue 0, 1 or 2 mod M (M = min(256, cap/4)). A capture writes at
+//    most two outbox rows (an UPDATE that changes the primary key), so it
+//    cannot step over three consecutive residues: at most M + 2 rows are
+//    written between checks, and the flag is raised with M + 2 rows of
+//    headroom.
+// The outbox therefore never exceeds the cap (by at most one row, only
+// for a key-changing UPDATE at the very edge on a tiny cap). Later rows of
+// the same transaction see the flag, so a capture gap is recorded in that
+// transaction. The insert cannot hit a constraint (NOT EXISTS), so an
+// application conflict clause can never fail the write.
+// Rows of headroom the guard keeps (see outbox_guard_sql). The flush
+// thread only clears the flag once the outbox is a further headroom BELOW
+// the raise point, so it can never undo a raise the guard just made.
+static long outbox_guard_headroom(long cap) {
+  long m = cap / 4;
+  if (m > 256) m = 256;
+  return m < 3 ? 1 : m + 2;
+}
+
+static void outbox_guard_sql(char *out, size_t cap_out) {
+  long cap = outbox_cap();
+  long m = cap / 4;
+  if (m > 256) m = 256;
+  if (m < 3) {
+    snprintf(out, cap_out,
+        "INSERT INTO _arkilian_meta (k, v) SELECT 'outbox_full', '1' "
+        "WHERE " ARK_OUTBOX_SPAN " + 1 > %ld "
+        "AND NOT EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'outbox_full');",
+        cap);
+  } else {
+    snprintf(out, cap_out,
+        "INSERT INTO _arkilian_meta (k, v) SELECT 'outbox_full', '1' "
+        "WHERE last_insert_rowid() %% %ld < 3 AND " ARK_OUTBOX_SPAN " + %ld > %ld "
+        "AND NOT EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'outbox_full');",
+        m, m + 2, cap);
+  }
+}
+
 int sync_backup_triggers(sqlite3 *db, char **err_out) {
   if (!db) return SQLITE_ERROR;
   int rc;
@@ -1882,36 +1929,23 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     }
   }
 
-  // Exact outbox cap at near-zero per-row cost. This guard runs inside
-  // the application's transaction on every M-th outbox row (a cheap
-  // NEW.id % M test; ids are consecutive) and raises the 'outbox_full'
-  // flag when fewer than M rows of room remain, so the outbox can never
-  // exceed ARKILIAN_MAX_QUEUE_DEPTH, and any later row of the SAME
-  // transaction already sees the flag (capture gap recorded atomically).
-  // The flush thread clears the flag once the outbox drains below 90%.
-  // The insert cannot hit a constraint (NOT EXISTS), so an application
-  // conflict clause can never turn it into a failed write.
+  // Outbox cap at near-zero per-row cost. Each capture trigger ends with
+  // a guard statement (outbox_guard_sql) that periodically raises the
+  // 'outbox_full' flag when the outbox is close to the cap. The outbox can therefore never exceed ARKILIAN_MAX_QUEUE_DEPTH,
+  // and later rows of the SAME transaction already see the flag (capture
+  // gap recorded atomically). The flush thread clears the flag once the
+  // outbox drains a further headroom below the raise point. The insert cannot hit a constraint (NOT
+  // EXISTS), so an application conflict clause can never fail the write.
+  // (Earlier 1.6 builds used a separate AFTER INSERT trigger on the
+  // outbox; a statement inside the capture trigger avoids a second
+  // trigger invocation per row.)
+  char guard_stmt[640];
   {
-    long cap = outbox_cap();
-    long m = cap / 4;
-    if (m > 256) m = 256;
-    if (m < 1) m = 1;
-    char *guard = sqlite3_mprintf(
-        "DROP TRIGGER IF EXISTS arkguard_outbox_cap; "
-        "CREATE TRIGGER arkguard_outbox_cap AFTER INSERT ON _pending_backup "
-        "WHEN NEW.id %% %ld = 0 BEGIN "
-        "INSERT INTO _arkilian_meta (k, v) SELECT 'outbox_full', '1' "
-        "WHERE " ARK_OUTBOX_SPAN " + %ld > %ld "
-        "AND NOT EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'outbox_full'); END;",
-        m, m, cap);
-    if (!guard) rc = SQLITE_NOMEM;
-    else {
-      rc = sqlite3_exec(db, guard, NULL, NULL, &errmsg);
-      sqlite3_free(guard);
-    }
+    outbox_guard_sql(guard_stmt, sizeof(guard_stmt));
+    rc = sqlite3_exec(db, "DROP TRIGGER IF EXISTS arkguard_outbox_cap;", NULL, NULL, &errmsg);
     if (rc != SQLITE_OK) {
       if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
-      if (err_out) *err_out = errmsg ? errmsg : sqlite3_mprintf("outbox guard: out of memory");
+      if (err_out) *err_out = errmsg;
       else sqlite3_free(errmsg);
       return rc;
     }
@@ -2145,21 +2179,22 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
         if (i == 2) {
           create_sql = sqlite3_mprintf(
               "CREATE TRIGGER \"trg_%w_ad\" AFTER DELETE ON \"%w\" WHEN %s BEGIN "
-              "INSERT INTO _pending_backup (payload) SELECT (%s); END;",
-              table, table, kWhenOk, delete_expr);
+              "INSERT INTO _pending_backup (payload) SELECT (%s); %s END;",
+              table, table, kWhenOk, delete_expr, guard_stmt);
         } else if (i == 1) {
           create_sql = sqlite3_mprintf(
               "CREATE TRIGGER \"trg_%w_au\" AFTER UPDATE ON \"%w\" WHEN %s BEGIN "
               "INSERT INTO _pending_backup (payload) SELECT (%s) WHERE %s; "
               "INSERT INTO _pending_backup (payload) SELECT ("
-              "'%s' || %s || ')'); END;",
-              table, table, kWhenOk, delete_expr, pk_changed, replace_lit, new_vals);
+              "'%s' || %s || ')'); %s END;",
+              table, table, kWhenOk, delete_expr, pk_changed, replace_lit, new_vals,
+              guard_stmt);
         } else {
           create_sql = sqlite3_mprintf(
               "CREATE TRIGGER \"trg_%w_ai\" AFTER INSERT ON \"%w\" WHEN %s BEGIN "
               "INSERT INTO _pending_backup (payload) SELECT ("
-              "'%s' || %s || ')'); END;",
-              table, table, kWhenOk, replace_lit, new_vals);
+              "'%s' || %s || ')'); %s END;",
+              table, table, kWhenOk, replace_lit, new_vals, guard_stmt);
         }
         if (!create_sql) { sqlite3_free(pk_changed); goto trigger_oom; }
         rc = sqlite3_exec(db, create_sql, NULL, NULL, &errmsg);
@@ -3868,6 +3903,13 @@ static void apply_ddl_capture(arkilian *db, const char *sql) {
               step_rc, sqlite3_errmsg(db->handle));
     }
     sqlite3_finalize(ddl_stmt);
+  }
+  // Same exact-cap guard the capture triggers run (DDL rows are written
+  // outside the triggers, so they must not skip a guard checkpoint).
+  {
+    char g[640];
+    outbox_guard_sql(g, sizeof(g));
+    sqlite3_exec(db->handle, g, NULL, NULL, NULL);
   }
 }
 

@@ -303,6 +303,11 @@ static void s3_failover_chain(void) {
       // Snapshot on a restored node: its image carries a stale
       // last_applied_lsn from its own restore, which used to make the next
       // restore refuse ("snapshot LSN < plan baseline").
+      // A cycle run before the startup manifest read resolves returns
+      // SQLITE_BUSY by design (the scheduler retries); wait for it.
+      for (int w = 0; w < 400 && !(db_backup_health_flags(db) & ARK_HF_MANIFEST_RESOLVED); w++)
+        usleep(25000);
+      assert(db_backup_health_flags(db) & ARK_HF_MANIFEST_RESOLVED);
       assert(arkilian_run_snapshot_cycle(db) == SQLITE_OK);
       writes(db, next, next + 9);
       next += 10;
@@ -421,10 +426,55 @@ static void s6_shutdown_backlog(void) {
   printf("  S6 a 16k-row backlog at shutdown is fully shipped and restorable\n");
 }
 
+// ── S7: the outbox cap holds under a mixed workload ─────────────────
+// Inserts, key-changing UPDATEs (two outbox rows each), DELETEs and DDL,
+// with nothing shipping: after EVERY operation the outbox must be within
+// ARKILIAN_MAX_QUEUE_DEPTH, and once it fills, a capture gap is recorded.
+static void s7_cap_mixed_workload(void) {
+  clear_s3_env();
+  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  setenv("ARKILIAN_MAX_QUEUE_DEPTH", "1000", 1);
+  rmdb("p0r_capmix.db");
+  arkilian *db = NULL;
+  assert(db_init(&db, "p0r_capmix.db") == 0);
+  assert(db_exec(db, "CREATE TABLE m(id INTEGER PRIMARY KEY, v INT)") == SQLITE_OK);
+  sqlite3 *h = db_get_handle(db);
+  unsigned r = 7;
+  long long peak = 0;
+  int next_id = 1;
+  for (int i = 0; i < 6000; i++) {
+    r ^= r << 13; r ^= r >> 17; r ^= r << 5;
+    char sql[160];
+    switch (r % 4) {
+      case 0: case 1:
+        snprintf(sql, sizeof(sql), "INSERT INTO m VALUES(%d, %u)", next_id++, r % 1000); break;
+      case 2:  // key-changing UPDATE: two outbox rows
+        snprintf(sql, sizeof(sql), "UPDATE m SET id = %d WHERE id = (SELECT max(id) FROM m)", next_id++); break;
+      default:
+        snprintf(sql, sizeof(sql), "DELETE FROM m WHERE id = (SELECT min(id) FROM m)"); break;
+    }
+    if (i == 2500) snprintf(sql, sizeof(sql), "CREATE TABLE m2(id INTEGER PRIMARY KEY)");
+    assert(db_exec(db, sql) == SQLITE_OK);
+    long long n = q1(h, "SELECT count(*) FROM _pending_backup");
+    if (n > peak) peak = n;
+    if (n > 1000) { fprintf(stderr, "outbox %lld > cap at op %d\n", n, i); assert(0); }
+  }
+  // It really filled: the guard raises the flag once fewer than its
+  // headroom (M + 2 = 252 rows for a cap of 1000) remain.
+  assert(peak > 1000 - 252);
+  assert(q1(h, "SELECT count(*) FROM _arkilian_meta WHERE k = 'capture_gap'") == 1);
+  assert(db_backup_capture_paused(db) == 1);
+  db_close(db);
+  rmdb("p0r_capmix.db");
+  unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
+  printf("  S7 outbox never exceeds its cap under a mixed workload (peak %lld/1000)\n", peak);
+}
+
 int main(void) {
   printf("=== P0 replication regressions ===\n");
   s1_pk_changes();
   s2_overflow();
+  s7_cap_mixed_workload();
   stub_start();
   s3_failover_chain();
   s4_split_brain();

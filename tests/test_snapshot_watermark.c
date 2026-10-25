@@ -51,8 +51,11 @@ static int copy_hook(sqlite3 *src, const char *dest, volatile int *flag) {
              "INSERT INTO users (id, name) VALUES (%d, 'user-%d')", i, i);
     assert(db_exec(g_db, sql) == SQLITE_OK);
   }
-  db_wal_flush(g_db);
-  for (int i = 0; i < 200 && db_backup_queue_depth(g_db) > 0; i++) usleep(50000);
+  // Generous bound: sanitizer builds under parallel ctest run ~10x slower.
+  for (int i = 0; i < 1200 && db_backup_queue_depth(g_db) > 0; i++) {
+    db_wal_flush(g_db);
+    usleep(50000);
+  }
   assert(db_backup_queue_depth(g_db) == 0);
   return backup_database(src, dest, flag);
 }

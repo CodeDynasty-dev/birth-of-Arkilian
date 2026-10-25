@@ -5,23 +5,30 @@
 > `ARKILIAN_ENABLE_BACKUP=0`, where fsync dominated both sides and hid the
 > capture cost, and the latency percentiles were histogram bucket edges.
 >
-> **Current numbers** (`bench/bench_cmp.c`: raw SQLite vs Arkilian with
-> capture on, prepared statements, identical pragmas, outbox drained outside
-> the timed region; Linux x86-64 VM, 4 vCPU; median of 3):
+> **Current numbers, MacBook (i7-9750H, macOS), default `synchronous=FULL`**
+> (`bash bench/minio/run.sh`, median of 3; raw SQLite vs Arkilian with
+> capture on, prepared statements, identical pragmas):
 >
-> | Workload | SQLite | Arkilian 1.5.0 | Arkilian 1.6.0 |
+> | Workload | SQLite | Arkilian 1.6.0 | Slower by |
 > | --- | --- | --- | --- |
-> | INSERT autocommit, `synchronous=NORMAL` | 51,404/s | 7,070/s (7.3x) | 16,264/s (3.2x) |
-> | INSERT, 1000/txn, `NORMAL` | 571,455 rows/s | 10,009 (57x) | 45,587 (12.5x) |
-> | UPDATE autocommit, `NORMAL` | 76,273/s | 16,624 (4.6x) | 30,516 (2.5x) |
-> | Point SELECT | 252,031/s | 229,039 (1.1x) | 228,139 (1.1x) |
-> | INSERT autocommit, `synchronous=FULL` (default) | 1,582/s | 1,078 (1.5x) | 1,273 (1.2x) |
-> | INSERT, 1000/txn, `FULL` | 357,456 rows/s | 9,777 (37x) | 40,455 (8.8x) |
+> | INSERT, one row per transaction | 7,080/s | 5,262/s | 1.35x |
+> | UPDATE, one row per transaction | 18,202/s | 12,017/s | 1.5x |
+> | INSERT, 1000 rows per transaction | 554,109 rows/s | 63,927 rows/s | 8.7x |
+> | Point SELECT | 233,467/s | 221,128/s | 1.06x |
 >
-> Single-row writes with the default `synchronous=FULL` are dominated by
-> fsync, so capture adds ~20%; in large transactions the per-row capture work
-> (an outbox row carrying replay SQL) dominates. Run `bash bench/minio/run.sh`
-> for the same comparison plus an end-to-end run against MinIO.
+> End to end against a local MinIO container on the same Mac: 4,853
+> single-row INSERTs/s while shipping (p99 488 us), all changes durable in
+> MinIO 0.6 s after the last write, snapshot of a 12.7 MiB database in 0.3 s,
+> full restore in 0.3 s and byte-identical to the source; through a 15 s
+> MinIO outage writes kept succeeding, the queue peaked at 5,520 rows and
+> drained within about 1 s of recovery, and the post-outage restore was
+> byte-identical too. A Google Compute Engine + GCS run is next.
+>
+> With `ARKILIAN_OUTBOX_DURABLE=0` (`synchronous=NORMAL`) on the same Mac:
+> single-row INSERT 13,640/s vs 37,824/s (2.8x), UPDATE 28,296/s vs 60,648/s
+> (2.1x), 1000-row transactions 64,535 vs 632,751 rows/s (9.8x). In large
+> transactions the per-row capture work (an outbox row carrying replay SQL)
+> dominates.
 
 **Benchmark Suite:** `tests/bench_1m.c`  
 **Test Hardware:** Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz, 6 Cores / 12 Threads, macOS 24.6.0  
