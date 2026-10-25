@@ -55,6 +55,7 @@
   #include <process.h>
   #include <sys/locking.h>
   #define strcasecmp _stricmp
+  #define strncasecmp _strnicmp
   #define ARK_FILENO(f) _fileno(f)
   #define ARK_FSYNC(fd) _commit(fd)
   #ifndef __MINGW32__
