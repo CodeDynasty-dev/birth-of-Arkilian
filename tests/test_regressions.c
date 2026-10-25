@@ -745,6 +745,7 @@ int main(void) {
   // Without it the startup manifest read never resolves, shipping stays
   // gated (by design since 1.6.0), and the dead-letter pass never runs.
   printf("  SKIP test_dead_letter_zombie_cleared (no S3 mock on Windows)\n");
+  (void)test_dead_letter_zombie_cleared; // keep it "used" under -Werror
 #endif
 
   printf("\n[Schema Desync Detection]\n");
