@@ -1319,7 +1319,133 @@ static int hydration_authorizer(void *pUser, int action,
   }
 }
 
+// Parse a leading "/*lsn:N*/" tag at p (after whitespace). Returns N (> 0)
+// and advances *pp past the tag, or 0 when there is no tag.
+static int64_t parse_lsn_tag(const char **pp) {
+  const char *p = *pp;
+  while (*p && isspace((unsigned char)*p)) p++;
+  if (strncmp(p, "/*lsn:", 6) != 0) return 0;
+  const char *q = p + 6;
+  int64_t v = 0;
+  int digits = 0;
+  while (*q >= '0' && *q <= '9' && digits < 19) { v = v * 10 + (*q - '0'); q++; digits++; }
+  if (digits == 0 || strncmp(q, "*/", 2) != 0) return 0;
+  *pp = q + 2;
+  return v;
+}
+
+// Execute a chunk statement by statement. Statements tagged with an LSN
+// <= skip_upto are already contained in the restored image (the chunk
+// straddles the snapshot baseline or the last applied LSN) and are
+// skipped: DDL is not idempotent, so re-running it would fail the restore.
+// Untagged statements (chunks written by older releases) inherit the
+// previous tag, or 0 = always run, preserving the old behavior.
+// Returns a pointer just past the ';' that terminates the statement
+// starting at p (or the end of the string). Quote- and comment-aware:
+// '...' and "..." (doubled-quote escapes), `...`, [...], -- and /* */.
+// Payload values come from quote(), so text containing ';' or a fake
+// "/*lsn:" tag inside a literal never splits a statement.
+static const char *stmt_end(const char *p) {
+  while (*p) {
+    char c = *p;
+    if (c == '\'' || c == '"' || c == '`') {
+      char q = c;
+      p++;
+      while (*p) {
+        if (*p == q) {
+          if (p[1] == q) { p += 2; continue; }
+          p++;
+          break;
+        }
+        p++;
+      }
+      continue;
+    }
+    if (c == '[') {
+      while (*p && *p != ']') p++;
+      if (*p) p++;
+      continue;
+    }
+    if (c == '-' && p[1] == '-') {
+      while (*p && *p != '\n') p++;
+      continue;
+    }
+    if (c == '/' && p[1] == '*') {
+      p += 2;
+      while (*p && !(p[0] == '*' && p[1] == '/')) p++;
+      if (*p) p += 2;
+      continue;
+    }
+    if (c == ';') return p + 1;
+    p++;
+  }
+  return p;
+}
+
+// Like stmt_end, but a CREATE statement (CREATE TRIGGER ... BEGIN ...; END)
+// is extended across ';' until SQLite itself reports the statement
+// complete.
+static const char *full_stmt_end(const char *p) {
+  const char *end = stmt_end(p);
+  if (strncasecmp(p, "CREATE", 6) != 0) return end;
+  while (*end) {
+    size_t n = (size_t)(end - p);
+    char *tmp = malloc(n + 1);
+    if (!tmp) return end;
+    memcpy(tmp, p, n);
+    tmp[n] = '\0';
+    int done = sqlite3_complete(tmp);
+    free(tmp);
+    if (done) return end;
+    const char *next = stmt_end(end);
+    if (next == end) return end;
+    end = next;
+  }
+  return end;
+}
+
+static int replay_statements(sqlite3 *db, const char *sql, int64_t skip_upto) {
+  const char *p = sql;
+  int64_t cur_lsn = 0;
+  while (p && *p) {
+    while (*p && (isspace((unsigned char)*p) || *p == ';')) p++;
+    if (!*p) break;
+    int64_t t = parse_lsn_tag(&p);
+    if (t > 0) cur_lsn = t;
+    const char *end = full_stmt_end(p);
+    if (end == p) break;
+    // Skip BEFORE preparing: preparing DDL whose effect is already in the
+    // image (CREATE TABLE of an existing table) fails at prepare time.
+    if (cur_lsn > 0 && cur_lsn <= skip_upto) { p = end; continue; }
+    sqlite3_stmt *st = NULL;
+    const char *tail = NULL;
+    int rc = sqlite3_prepare_v2(db, p, (int)(end - p), &st, &tail);
+    if (rc != SQLITE_OK) {
+      fprintf(stderr, "arkilian: replay prepare failed at LSN %lld: %s\n",
+              (long long)cur_lsn, sqlite3_errmsg(db));
+      sqlite3_finalize(st);
+      return rc;
+    }
+    p = end;
+    if (!st) continue;  // comment/whitespace only
+    do { rc = sqlite3_step(st); } while (rc == SQLITE_ROW);
+    if (rc != SQLITE_DONE) {
+      fprintf(stderr, "arkilian: replay failed at LSN %lld: %s\n",
+              (long long)cur_lsn, sqlite3_errmsg(db));
+      sqlite3_finalize(st);
+      return rc;
+    }
+    sqlite3_finalize(st);
+  }
+  return SQLITE_OK;
+}
+
 int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn) {
+  return hydrate_replay_chunk_ex(db, raw_sql, chunk_lsn, 0);
+}
+
+int hydrate_replay_chunk_ex(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn,
+                            int64_t skip_upto) {
   char *err_msg = NULL;
 
   // ── Trigger isolation (defense in depth) ──────────────────────────
@@ -1351,8 +1477,9 @@ int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn) {
     return HYDRATION_ERR_SQL;
   }
 
-  // 2. Replay the raw multi-statement SQL text
-  rc = sqlite3_exec(db, raw_sql, NULL, NULL, &err_msg);
+  // 2. Replay the chunk statement by statement, skipping statements the
+  //    restored image already contains.
+  rc = raw_sql ? replay_statements(db, raw_sql, skip_upto) : SQLITE_MISUSE;
   if (rc != SQLITE_OK) {
     if (err_msg) sqlite3_free(err_msg);
     sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
@@ -1719,19 +1846,21 @@ int arkilian_hydrate_s3(const char *db_path,
     // tables are either already shipped (baseline) or would be duplicate
     // outbox work after restore. Clean them while triggers are disabled so
     // the DELETEs themselves do not generate new capture rows.
-    sqlite3_exec(db, "DELETE FROM _pending_backup; DELETE FROM _dead_backup; DELETE FROM sqlite_sequence WHERE name IN ('_pending_backup','_dead_backup');", NULL, NULL, NULL);
+    // The outbox sequence (sqlite_sequence) is NOT reset: it is re-seeded
+    // below to the restored LSN head so the restored node continues the
+    // prefix's LSN history instead of restarting at 1 (which produced an
+    // overlapping, unrestorable manifest after the first failover).
+    // A capture-gap marker copied with the image is covered by it, and the
+    // source's outbox-full flag describes an outbox the restore discards.
+    sqlite3_exec(db, "DELETE FROM _pending_backup; DELETE FROM _dead_backup; "
+                     "DELETE FROM _arkilian_meta WHERE k IN ('capture_gap', 'outbox_full');",
+                 NULL, NULL, NULL);
 
-    int64_t local_lsn = read_last_applied_lsn(db);
-    if (local_lsn == 0) local_lsn = plan.baseline_lsn;
-    else if (local_lsn < plan.baseline_lsn) {
-      fprintf(stderr,
-              "arkilian: hydration refused — snapshot LSN %lld < plan baseline %lld\n",
-              (long long)local_lsn, (long long)plan.baseline_lsn);
-      sqlite3_close(db);
-      hydrate_plan_free(&plan);
-      hydrate_result = HYDRATION_ERR_PROTO;
-      goto hydrate_done;
-    }
+    // The restored image sits exactly at the plan's baseline: a snapshot
+    // was just installed (its own last_applied_lsn, if any, describes an
+    // older restore of the source and is stale), or a fresh database was
+    // created for a cold start at baseline 0.
+    int64_t local_lsn = plan.baseline_lsn;
 
     int chunk_total = 0;
     for (int i = 0; i < plan.chunk_count; i++) {
@@ -1792,7 +1921,7 @@ int arkilian_hydrate_s3(const char *db_path,
         }
       }
 
-      rc = hydrate_replay_chunk(db, sql_text, ch->lsn_end);
+      rc = hydrate_replay_chunk_ex(db, sql_text, ch->lsn_end, local_lsn);
       free(sql_text);
       if (rc != 0) {
         fprintf(stderr, "arkilian: hydrate_replay_chunk failed rc=%d\n", rc);
@@ -1802,6 +1931,39 @@ int arkilian_hydrate_s3(const char *db_path,
       local_lsn = ch->lsn_end;
       chunk_total++;
       if (progress) progress(2, chunk_total, plan.chunk_count, user_data);
+    }
+
+    // LSN continuity: record the restored head and seed the outbox
+    // sequence with it, so the next captured change on this node is
+    // head+1 — exactly where the prefix's history continues.
+    {
+      sqlite3_exec(db,
+        "CREATE TABLE IF NOT EXISTS _pending_backup ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  payload TEXT NOT NULL,"
+        "  attempts INTEGER NOT NULL DEFAULT 0,"
+        "  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+        "  last_attempt_at INTEGER"
+        ");", NULL, NULL, NULL);
+      char seq_sql[512];
+      snprintf(seq_sql, sizeof(seq_sql),
+        "BEGIN;"
+        "DELETE FROM sqlite_sequence WHERE name = '_pending_backup';"
+        "INSERT INTO sqlite_sequence (name, seq) VALUES ('_pending_backup', %lld);"
+        "INSERT OR REPLACE INTO _arkilian_meta (k, v) VALUES ('last_applied_lsn', '%lld');"
+        "COMMIT;",
+        (long long)local_lsn, (long long)local_lsn);
+      char *serr = NULL;
+      if (sqlite3_exec(db, seq_sql, NULL, NULL, &serr) != SQLITE_OK) {
+        fprintf(stderr, "arkilian: failed to seed LSN head %lld: %s\n",
+                (long long)local_lsn, serr ? serr : "?");
+        sqlite3_free(serr);
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        sqlite3_close(db);
+        hydrate_plan_free(&plan);
+        hydrate_result = HYDRATION_ERR_SQL;
+        goto hydrate_done;
+      }
     }
 
     // Leave replay mode: re-enable trigger firing so the restored DB is

@@ -115,8 +115,7 @@ static void reset_captured_log(void) {
 static void get_captured_log(char *out, size_t out_cap, int *out_count) {
   lock_log();
   if (out && out_cap) {
-    strncpy(out, g_captured, out_cap - 1);
-    out[out_cap - 1] = '\0';
+    snprintf(out, out_cap, "%s", g_captured);
   }
   if (out_count) *out_count = g_capture_count;
   unlock_log();

@@ -38,25 +38,22 @@ extern int backup_database(sqlite3 *pSource, const char *zFilename,
 
 static arkilian *g_db = NULL;
 
-// Runs INSIDE the copy window (the snapshot thread's copy step). Simulates
-// the flush thread shipping rows 21..30 as chunk lsn 22..31 while the
-// snapshot copy is in progress, then performs the real copy.
+// Runs INSIDE the copy window (the snapshot thread's copy step, while the
+// snapshot connection holds its read transaction). The application commits
+// rows 21..30 (outbox LSN 22..31) and the REAL flush thread ships and
+// registers them as a chunk while the copy is in progress; only then does
+// the copy run. Those rows committed after the snapshot's read point, so
+// they are NOT in the image and the chunk must stay in the manifest.
 static int copy_hook(sqlite3 *src, const char *dest, volatile int *flag) {
-  char body[2048];
-  size_t off = 0;
   for (int i = 21; i <= 30; i++) {
-    off += (size_t)snprintf(body + off, sizeof(body) - off,
-                            "INSERT OR REPLACE INTO users (id, name) "
-                            "VALUES (%d, 'user-%d');\n", i, i);
+    char sql[128];
+    snprintf(sql, sizeof(sql),
+             "INSERT INTO users (id, name) VALUES (%d, 'user-%d')", i, i);
+    assert(db_exec(g_db, sql) == SQLITE_OK);
   }
-  char key[512];
-  snprintf(key, sizeof(key), "%s/chunks/lsn_0000000022_0000000031.sql",
-           PREFIX);
-  stub_put(key, body, off);
-  char sha[65];
-  ark_sha256_hex(body, off, sha);
-  // The exact call the flush thread makes after a successful PUT.
-  assert(arkilian_registry_record(g_db, key, sha, 22, 31) == 0);
+  db_wal_flush(g_db);
+  for (int i = 0; i < 200 && db_backup_queue_depth(g_db) > 0; i++) usleep(50000);
+  assert(db_backup_queue_depth(g_db) == 0);
   return backup_database(src, dest, flag);
 }
 
@@ -142,7 +139,7 @@ int main(void) {
     assert(strstr(body, "\"baseline_lsn\":21") != NULL);
     // ── Invariant 2: the mid-copy chunk record survived pruning — its rows
     // are NOT in the snapshot, so hydration must still replay it.
-    assert(strstr(body, "lsn_0000000022_0000000031.sql") != NULL);
+    assert(strstr(body, "lsn_0000000022_0000000031_") != NULL);
     // ── Invariant 3: the pre-copy chunk record was pruned (covered by the
     // snapshot — replaying it would be redundant).
     assert(strstr(body, "\"lsn_end\":21}") == NULL);
@@ -159,9 +156,9 @@ int main(void) {
     assert(hrc == HYDRATION_OK);
     assert(count_rows("wm_dst.db", "users") == 30);
 
-    // Telemetry sanity: chunk_count is a real counter (1 real flush; the
-    // hook-injected record is bookkeeping, not a flush).
-    assert(db_backup_chunk_count(g_db) == 1);
+    // Telemetry sanity: chunk_count is a real counter (2 real flushes: the
+    // pre-copy chunk and the one shipped during the copy).
+    assert(db_backup_chunk_count(g_db) == 2);
 
     db_close(g_db);
     g_db = NULL;

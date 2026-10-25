@@ -90,6 +90,11 @@
 #elif defined(_WIN32)
 #define ARK_ATOMIC_ADD(ptr, val) (_InterlockedExchangeAdd((volatile long*)(ptr), (long)(val)) + (val))
 #endif
+#ifdef __GNUC__
+#define ARK_XCHG(ptr, val) __atomic_exchange_n((ptr), (val), __ATOMIC_ACQ_REL)
+#elif defined(_WIN32)
+#define ARK_XCHG(ptr, val) ((int)_InterlockedExchange((volatile long*)(ptr), (long)(val)))
+#endif
 
 // statfs-based network filesystem detection (NFS/SMB/AFP) for the
 // WAL-incompatibility guard in db_init (Risk #3). BSD/Mac expose
@@ -271,6 +276,14 @@ struct arkilian {
   // only the incremental *records* — the next hourly snapshot baseline
   // re-covers every row the chunk objects could have carried.
   uint64_t chunk_flushed_upto;
+  volatile int snapshot_published;
+  volatile int capture_activity;    // a captured-table row changed since the flush thread last looked
+  volatile int last_wake_ds;        // decisecond bucket of the last flush-thread wake signal
+  char freeze_reason[600];          // why shipping is frozen (re-logged while frozen)
+  time_t freeze_logged_at;  // last snapshot cycle reached a published manifest
+  char writer_id[17];            // random per-process id baked into chunk keys:
+                                 // two writers (or a restored node) can never
+                                 // overwrite each other's chunk objects
 
   // Manifest registry: the client-side record of every uploaded WAL chunk,
   // mirrored to {prefix}/manifest.json. Guarded by manifest_mutex; the
@@ -422,8 +435,13 @@ static int manifest_registry_append(arkilian *db, char *s3_key, char *sha256,
 static void manifest_registry_prune_upto(arkilian *db, uint64_t baseline_lsn);
 static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
                                     const char *snapshot_sha,
-                                    uint64_t baseline_lsn);
+                                    uint64_t baseline_lsn,
+                                    uint64_t publish_upto);
 static void manifest_registry_maybe_upload(arkilian *db);
+static void manifest_registry_publish(arkilian *db, int force);
+static int snapshot_upload_and_publish(arkilian *db, const char *stage,
+                                       uint64_t snapshot_upto,
+                                       const char *gap_at_copy);
 static int manifest_registry_seed(arkilian *db);
 char *db_s3_presign_get(arkilian *db, const char *key, long expires_sec);
 
@@ -481,6 +499,127 @@ static long outbox_cap(void) {
                                        ARKILIAN_DEFAULT_MAX_QUEUE_DEPTH);
   if (cap < 1) cap = 1;
   return cap;
+}
+
+// Outbox occupancy as an O(log n) upper bound: ids are AUTOINCREMENT and
+// contiguous within the live outbox (dead-lettering removes only the head
+// chunk), so max(id)-min(id)+1 >= COUNT(*). Two rowid min/max lookups
+// replace the full-table COUNT(*) every captured row used to pay, which
+// made each write slower in proportion to the unshipped backlog.
+#define ARK_OUTBOX_SPAN \
+  "coalesce((SELECT max(id) FROM _pending_backup) - " \
+  "(SELECT min(id) FROM _pending_backup) + 1, 0)"
+
+// Durable capture-gap marker: bumped (never silently skipped) when a row
+// cannot be captured. Written in the same transaction as the write that
+// overflowed, so any partially captured transaction is always accompanied
+// by the marker. Manifests are withheld while it exists; a snapshot that
+// observed it rebases the backup and clears it.
+//
+// Two statements that can never hit a constraint: inside a trigger, an
+// explicit conflict clause on the APPLICATION's statement (INSERT OR
+// IGNORE, OR ABORT, ...) overrides the body's own, so an "INSERT OR
+// REPLACE" bump would be ignored (or abort the app's write).
+#define ARK_GAP_BUMP_SQL \
+  "UPDATE _arkilian_meta SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT) " \
+  "WHERE k = 'capture_gap'; " \
+  "INSERT INTO _arkilian_meta (k, v) SELECT 'capture_gap', '1' " \
+  "WHERE NOT EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'capture_gap');"
+
+// Standalone (non-trigger) unconditional bump.
+#define ARK_GAP_MARK_SQL \
+  "INSERT OR REPLACE INTO _arkilian_meta (k, v) SELECT 'capture_gap', " \
+  "CAST(coalesce((SELECT CAST(v AS INTEGER) FROM _arkilian_meta " \
+  "WHERE k = 'capture_gap'), 0) + 1 AS TEXT)"
+
+// ARKILIAN_CAPTURE_OVERFLOW=abort: strict mode — a write that cannot be
+// captured fails with SQLITE_CONSTRAINT instead of opening a capture gap.
+static int capture_overflow_abort(void) {
+  const char *v = getenv("ARKILIAN_CAPTURE_OVERFLOW");
+  return v && strcasecmp(v, "abort") == 0;
+}
+
+// Reads the capture-gap marker and the highest LSN ever assigned
+// (sqlite_sequence for _pending_backup) in ONE read transaction, so the
+// pair is a consistent view. Returns 0 on success. gap_out receives the
+// marker text ("" when absent).
+static int read_gap_and_seq(sqlite3 *h, char *gap_out, size_t gap_cap,
+                            uint64_t *seq_out) {
+  if (!h) return -1;
+  if (gap_out && gap_cap) gap_out[0] = '\0';
+  if (seq_out) *seq_out = 0;
+  int own = sqlite3_get_autocommit(h);
+  if (own && sqlite3_exec(h, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK) return -1;
+  int rc = 0;
+  sqlite3_stmt *st = NULL;
+  if (sqlite3_prepare_v2(h, "SELECT v FROM _arkilian_meta WHERE k = 'capture_gap'",
+                         -1, &st, NULL) == SQLITE_OK) {
+    int s = sqlite3_step(st);
+    if (s == SQLITE_ROW) {
+      const char *v = (const char *)sqlite3_column_text(st, 0);
+      if (gap_out && gap_cap) snprintf(gap_out, gap_cap, "%s", v ? v : "1");
+    } else if (s != SQLITE_DONE) rc = -1;
+  } else {
+    rc = -1;
+  }
+  sqlite3_finalize(st);
+  st = NULL;
+  if (rc == 0 && sqlite3_prepare_v2(h,
+        "SELECT seq FROM sqlite_sequence WHERE name = '_pending_backup'",
+        -1, &st, NULL) == SQLITE_OK) {
+    int s = sqlite3_step(st);
+    if (s == SQLITE_ROW && seq_out) *seq_out = (uint64_t)sqlite3_column_int64(st, 0);
+    else if (s != SQLITE_ROW && s != SQLITE_DONE) rc = -1;
+  }
+  // sqlite_sequence may not exist yet (no AUTOINCREMENT table created):
+  // that is seq 0, not an error.
+  sqlite3_finalize(st);
+  if (own) sqlite3_exec(h, "COMMIT;", NULL, NULL, NULL);
+  return rc;
+}
+
+// Outbox-full flag maintenance on the flush thread. The flag is RAISED
+// inside application transactions by the arkguard_outbox_cap trigger
+// (exact cap); this clears it once the outbox drains below 90% of the
+// cap, and raises it as a safety net if the outbox is ever found at cap.
+static void update_outbox_full_flag(arkilian *db) {
+  if (!db || !db->backup_db) return;
+  sqlite3_stmt *st = NULL;
+  long long span = -1;
+  int flagged = 0;
+  if (sqlite3_prepare_v2(db->backup_db,
+        "SELECT " ARK_OUTBOX_SPAN ", EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'outbox_full')",
+        -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
+    span = sqlite3_column_int64(st, 0);
+    flagged = sqlite3_column_int(st, 1);
+  }
+  sqlite3_finalize(st);
+  if (span < 0) return;
+  long cap = outbox_cap();
+  long low = cap >= 10 ? cap - cap / 10 : cap;
+  if (!flagged && span >= cap) {
+    sqlite3_exec(db->backup_db,
+                 "INSERT OR IGNORE INTO _arkilian_meta (k, v) VALUES ('outbox_full', '1');",
+                 NULL, NULL, NULL);
+  } else if (flagged && span < low) {
+    sqlite3_exec(db->backup_db, "DELETE FROM _arkilian_meta WHERE k = 'outbox_full';",
+                 NULL, NULL, NULL);
+  }
+}
+
+// Freeze shipping + publishing with a reason that is logged now and
+// re-logged while the freeze lasts (synchronously on every db_wal_flush,
+// and by the flush thread every 60 s), so an operator never misses why
+// nothing ships.
+void ark_log(arkilian *db, ark_log_level_t level, const char *fmt, ...);
+static void freeze_shipping(arkilian *db, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(db->freeze_reason, sizeof(db->freeze_reason), fmt, ap);
+  va_end(ap);
+  ark_log(db, ARK_LOG_ERROR, "%s", db->freeze_reason);
+  db->freeze_logged_at = time(NULL);
+  ARK_STORE(&db->manifest_seed_resolved, -1);
 }
 
 // ── Unique staging files (O_EXCL, owner-only) ───────────────────────
@@ -1722,11 +1861,10 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     "  k TEXT PRIMARY KEY,"
     "  v TEXT"
     ");",
-    // Oldest-pending-age monitoring does MIN(created_at) on the app
-    // thread; without an index that's a full scan of a (possibly large)
-    // backlog.
-    "CREATE INDEX IF NOT EXISTS idx_pending_backup_created "
-    "  ON _pending_backup(created_at);",
+    // Oldest-pending-age monitoring reads the head row by rowid (ids are
+    // assigned in commit order), so no secondary index is maintained on
+    // the hot capture path. Older releases created one; drop it.
+    "DROP INDEX IF EXISTS idx_pending_backup_created;",
     // Internal-schema version marker: future releases bump
     // ARKILIAN_SCHEMA_VERSION and migrate; a node whose schema version
     // EXCEEDS the running binary's is detected at init instead of
@@ -1739,6 +1877,41 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     if (rc != SQLITE_OK) {
       if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
       if (err_out) *err_out = errmsg;
+      else sqlite3_free(errmsg);
+      return rc;
+    }
+  }
+
+  // Exact outbox cap at near-zero per-row cost. This guard runs inside
+  // the application's transaction on every M-th outbox row (a cheap
+  // NEW.id % M test; ids are consecutive) and raises the 'outbox_full'
+  // flag when fewer than M rows of room remain, so the outbox can never
+  // exceed ARKILIAN_MAX_QUEUE_DEPTH, and any later row of the SAME
+  // transaction already sees the flag (capture gap recorded atomically).
+  // The flush thread clears the flag once the outbox drains below 90%.
+  // The insert cannot hit a constraint (NOT EXISTS), so an application
+  // conflict clause can never turn it into a failed write.
+  {
+    long cap = outbox_cap();
+    long m = cap / 4;
+    if (m > 256) m = 256;
+    if (m < 1) m = 1;
+    char *guard = sqlite3_mprintf(
+        "DROP TRIGGER IF EXISTS arkguard_outbox_cap; "
+        "CREATE TRIGGER arkguard_outbox_cap AFTER INSERT ON _pending_backup "
+        "WHEN NEW.id %% %ld = 0 BEGIN "
+        "INSERT INTO _arkilian_meta (k, v) SELECT 'outbox_full', '1' "
+        "WHERE " ARK_OUTBOX_SPAN " + %ld > %ld "
+        "AND NOT EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'outbox_full'); END;",
+        m, m, cap);
+    if (!guard) rc = SQLITE_NOMEM;
+    else {
+      rc = sqlite3_exec(db, guard, NULL, NULL, &errmsg);
+      sqlite3_free(guard);
+    }
+    if (rc != SQLITE_OK) {
+      if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+      if (err_out) *err_out = errmsg ? errmsg : sqlite3_mprintf("outbox guard: out of memory");
       else sqlite3_free(errmsg);
       return rc;
     }
@@ -1927,33 +2100,81 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
           {"ai", "INSERT"}, {"au", "UPDATE"}, {"ad", "DELETE"}
       };
 
+      // PK-change predicate for the UPDATE trigger: an UPDATE that moves
+      // a row to a new key must ship a DELETE of the OLD key before the
+      // REPLACE of the new one, or the replica keeps the old row as a
+      // ghost (REPLACE only touches the NEW key).
+      char *pk_changed = NULL;
+      for (int i = 0; i < ncols; i++) {
+        if (pk_ranks[i] == 0) continue;
+        char *next = pk_changed
+          ? sqlite3_mprintf("%s OR OLD.\"%w\" IS NOT NEW.\"%w\"", pk_changed, cols[i], cols[i])
+          : sqlite3_mprintf("OLD.\"%w\" IS NOT NEW.\"%w\"", cols[i], cols[i]);
+        sqlite3_free(pk_changed);
+        pk_changed = next;
+        if (!pk_changed) goto trigger_oom;
+      }
+
+      // Overflow handling (soft cap, see update_outbox_full_flag): the
+      // capture trigger runs only while the 'outbox_full' flag is absent;
+      // a companion arkgap_* trigger runs only while it is present and
+      // either records a durable capture gap in the SAME transaction or,
+      // in strict mode (ARKILIAN_CAPTURE_OVERFLOW=abort), fails the write.
+      // Both guards are one primary-key probe of a tiny table, and the
+      // gap bump uses statements that cannot hit a constraint (an explicit
+      // conflict clause on the application's statement overrides the
+      // trigger body's own).
+      static const char *const kWhenOk =
+          "NOT EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'outbox_full')";
+      static const char *const kWhenFull =
+          "EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'outbox_full')";
+      const char *gap_body = capture_overflow_abort()
+          ? "SELECT RAISE(ABORT, 'arkilian: backup outbox full');"
+          : ARK_GAP_BUMP_SQL;
+
       for (int i = 0; i < 3; i++) {
-        char *drop_sql = sqlite3_mprintf("DROP TRIGGER IF EXISTS \"trg_%w_%s\";", table, ops[i][0]);
-        if (!drop_sql) goto trigger_oom;
+        char *drop_sql = sqlite3_mprintf(
+            "DROP TRIGGER IF EXISTS \"trg_%w_%s\"; DROP TRIGGER IF EXISTS \"arkgap_%w_%s\";",
+            table, ops[i][0], table, ops[i][0]);
+        if (!drop_sql) { sqlite3_free(pk_changed); goto trigger_oom; }
         rc = sqlite3_exec(db, drop_sql, NULL, NULL, &errmsg);
         sqlite3_free(drop_sql);
-        if (rc != SQLITE_OK) goto trigger_fail;
+        if (rc != SQLITE_OK) { sqlite3_free(pk_changed); goto trigger_fail; }
 
         char *create_sql = NULL;
         if (i == 2) {
           create_sql = sqlite3_mprintf(
-              "CREATE TRIGGER \"trg_%w_ad\" AFTER DELETE ON \"%w\" BEGIN "
-              "INSERT INTO _pending_backup (payload) SELECT (%s) "
-              "WHERE (SELECT COUNT(*) FROM _pending_backup) < %ld; END;",
-              table, table, delete_expr, outbox_cap());
+              "CREATE TRIGGER \"trg_%w_ad\" AFTER DELETE ON \"%w\" WHEN %s BEGIN "
+              "INSERT INTO _pending_backup (payload) SELECT (%s); END;",
+              table, table, kWhenOk, delete_expr);
+        } else if (i == 1) {
+          create_sql = sqlite3_mprintf(
+              "CREATE TRIGGER \"trg_%w_au\" AFTER UPDATE ON \"%w\" WHEN %s BEGIN "
+              "INSERT INTO _pending_backup (payload) SELECT (%s) WHERE %s; "
+              "INSERT INTO _pending_backup (payload) SELECT ("
+              "'%s' || %s || ')'); END;",
+              table, table, kWhenOk, delete_expr, pk_changed, replace_lit, new_vals);
         } else {
           create_sql = sqlite3_mprintf(
-              "CREATE TRIGGER \"trg_%w_%s\" AFTER %s ON \"%w\" BEGIN "
+              "CREATE TRIGGER \"trg_%w_ai\" AFTER INSERT ON \"%w\" WHEN %s BEGIN "
               "INSERT INTO _pending_backup (payload) SELECT ("
-              "'%s' || %s || ')') WHERE (SELECT COUNT(*) FROM _pending_backup) < %ld; END;",
-              table, ops[i][0], ops[i][1], table, replace_lit, new_vals, outbox_cap());
+              "'%s' || %s || ')'); END;",
+              table, table, kWhenOk, replace_lit, new_vals);
         }
-        if (!create_sql) goto trigger_oom;
-
+        if (!create_sql) { sqlite3_free(pk_changed); goto trigger_oom; }
         rc = sqlite3_exec(db, create_sql, NULL, NULL, &errmsg);
         sqlite3_free(create_sql);
-        if (rc != SQLITE_OK) goto trigger_fail;
+        if (rc != SQLITE_OK) { sqlite3_free(pk_changed); goto trigger_fail; }
+
+        char *gap_sql = sqlite3_mprintf(
+            "CREATE TRIGGER \"arkgap_%w_%s\" AFTER %s ON \"%w\" WHEN %s BEGIN %s END;",
+            table, ops[i][0], ops[i][1], table, kWhenFull, gap_body);
+        if (!gap_sql) { sqlite3_free(pk_changed); goto trigger_oom; }
+        rc = sqlite3_exec(db, gap_sql, NULL, NULL, &errmsg);
+        sqlite3_free(gap_sql);
+        if (rc != SQLITE_OK) { sqlite3_free(pk_changed); goto trigger_fail; }
       }
+      sqlite3_free(pk_changed);
       goto triggers_done;
 
 trigger_oom:
@@ -2030,6 +2251,21 @@ static void on_db_update(void *user_data, int op_type, char const *db_name,
   (void)op_type; (void)db_name; (void)row_id;
   if (!db || is_reserved_table(table_name)) return;
 
+  // Coalesced wake-up. This hook fires for EVERY changed row, before the
+  // transaction commits (the flush thread cannot see the rows yet), and
+  // signalling the flush thread each time made it spin on empty drains in
+  // lock-step with the writer — that contention, not the capture itself,
+  // dominated per-write cost. Now: mark activity (one atomic store) and
+  // signal at most once per 100 ms; while activity continues the flush
+  // thread polls every 100 ms, so a trailing commit is picked up within
+  // ~100 ms instead of on every row.
+  ARK_STORE(&db->capture_activity, 1);
+  {
+    int ds = (int)((now_ms_mono() / 100) & 0x7fffffff);
+    if (ARK_LOAD(&db->last_wake_ds) == ds) return;
+    ARK_STORE(&db->last_wake_ds, ds);
+  }
+
   // The flag and the signal must be issued under the mutex — otherwise
   // the flush thread can miss the wakeup between its predicate check
   // and pthread_cond_timedwait().
@@ -2105,11 +2341,26 @@ static int on_schema_authorizer(void *user_data, int action,
 // Abort callback for in-flight transfers: returns non-zero when shutdown
 // is requested so db_close() never waits out a full curl timeout (10s /
 // 30s) joining a thread stuck in a slow request.
+// Shutdown drain window. The flush thread sets a per-thread deadline for
+// its final drain so the transfers that publish the last chunks and the
+// manifest are NOT cancelled by the shutdown flag (previously every final
+// upload aborted immediately with CURLE_ABORTED_BY_CALLBACK, so a clean
+// shutdown never published its tail). Other threads (snapshot uploads)
+// still abort promptly. Bounded by ARKILIAN_SHUTDOWN_DRAIN_SEC (default 10).
+#if defined(_MSC_VER)
+#define ARK_TLS __declspec(thread)
+#else
+#define ARK_TLS __thread
+#endif
+static ARK_TLS time_t t_drain_deadline = 0;
+
 static int curl_abort_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
                          curl_off_t ultotal, curl_off_t ulnow) {
   (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
   volatile int *shutdown_flag = (volatile int *)clientp;
-  return (shutdown_flag && ARK_LOAD(shutdown_flag)) ? 1 : 0;
+  if (!(shutdown_flag && ARK_LOAD(shutdown_flag))) return 0;
+  if (t_drain_deadline != 0 && time(NULL) < t_drain_deadline) return 0;
+  return 1;
 }
 
 // Write callback to silently discard HTTP response bodies during S3 uploads
@@ -2227,16 +2478,26 @@ static int wal_chunk_append(wal_chunk *c, const char *sql, int sql_len,
     c->opened_at = time(NULL);
   }
 
-  size_t needed = c->len + (size_t)sql_len + 2;
+  // Each statement is prefixed with its LSN as a SQL comment
+  // ("/*lsn:N*/"). The object stays plain replayable SQL, and hydration
+  // can skip exactly the statements a snapshot already contains when a
+  // chunk straddles the snapshot's baseline (DDL is not idempotent).
+  char tag[40];
+  int tag_len = snprintf(tag, sizeof(tag), "/*lsn:%llu*/", (unsigned long long)outbox_id);
+  if (tag_len < 0 || tag_len >= (int)sizeof(tag)) return -1;
+  size_t needed = c->len + (size_t)tag_len + (size_t)sql_len + 2;
   if (c->cap < needed) {
-    c->cap = needed < 65536 ? needed * 2 : needed + 65536;
-    char *p = realloc(c->buffer, c->cap);
+    size_t ncap = needed < 65536 ? needed * 2 : needed + 65536;
+    char *p = realloc(c->buffer, ncap);
     if (!p) return -1;
     c->buffer = p;
+    c->cap = ncap;
   }
+  memcpy(c->buffer + c->len, tag, (size_t)tag_len);
+  c->len += (size_t)tag_len;
 
   // Store plain replayable SQL terminated with ";\n": the flushed chunk
-  // object is fed straight into sqlite3_exec() by the hydration engine,
+  // object is replayed statement by statement by the hydration engine,
   // so no binary framing may remain in the object body.
   memcpy(c->buffer + c->len, sql, (size_t)sql_len);
   c->buffer[c->len + (size_t)sql_len] = ';';
@@ -2292,10 +2553,11 @@ static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c,
   // 3. Build the S3 key and presign the PUT URL locally (SigV4).
   char s3_key[512];
   snprintf(s3_key, sizeof(s3_key),
-           "%s/chunks/lsn_%010llu_%010llu.sql",
+           "%s/chunks/lsn_%010llu_%010llu_%s.sql",
            db->s3_prefix,
            (unsigned long long)c->lsn_start,
-           (unsigned long long)c->lsn_end);
+           (unsigned long long)c->lsn_end,
+           db->writer_id);
 
   char *put_url = s3_presign_put(db, s3_key, 600L);
   if (!put_url) { unlink(tmp_path); return SHIP_RETRY; }
@@ -2607,15 +2869,31 @@ void *run_wal_flush(void *arg) {
       }
     }
 
+    // Shipping waits for the startup manifest read to resolve. Chunks
+    // registered before the predecessor registry is adopted would land
+    // ahead of older records (an unsorted manifest that restore rejects),
+    // and a frozen registry (unreadable, or remote ahead of this
+    // database: a second writer or an un-restored node) must not keep
+    // consuming outbox rows into objects nothing will ever reference.
+    // Rows simply stay durable in the local outbox meanwhile.
+    int ship_ok = ARK_LOAD(&db->backup_enabled) && ARK_LOAD(&db->s3_creds_loaded) &&
+                  ARK_LOAD(&db->manifest_seed_resolved) == 1;
+    {
+      if (ARK_LOAD(&db->manifest_seed_resolved) == -1 && db->freeze_reason[0] &&
+          time(NULL) - db->freeze_logged_at >= 60) {
+        ark_log(db, ARK_LOG_ERROR, "%s", db->freeze_reason);
+        db->freeze_logged_at = time(NULL);
+      }
+    }
+
     int drained = 0;
-    if (ARK_LOAD(&db->backup_enabled) && ARK_LOAD(&db->s3_creds_loaded)) {
+    if (ship_ok) {
       drained = drain_chunk(db, &db->chunk, select_stmt);
     }
 
     // Both the drain and the flush are gated on the kill-switch: a
     // disabled backup must never ship rows already sitting in the buffer.
-    if (ARK_LOAD(&db->backup_enabled) && ARK_LOAD(&db->s3_creds_loaded) &&
-        db->chunk.entry_count > 0) {
+    if (ship_ok && db->chunk.entry_count > 0) {
       time_t age = time(NULL) - db->chunk.opened_at;
       if (age >= db->chunk_interval || db->chunk.len >= CHUNK_MAX_SIZE_BYTES) {
         int flush_rc = wal_chunk_flush_to_s3(db, &db->chunk, delete_stmt);
@@ -2652,21 +2930,32 @@ void *run_wal_flush(void *arg) {
     // the queue drains (the snapshot thread clears it on successful upload).
     // Queried on backup_db (spec §3.1) so the flush thread never contends
     // on the app connection.
-    if (ARK_LOAD(&db->backup_enabled) && count_stmt) {
-      if (sqlite3_step(count_stmt) == SQLITE_ROW &&
-          sqlite3_column_int(count_stmt, 0) >= outbox_cap()) {
-        ARK_STORE(&db->capture_paused, 1);
-      }
-      sqlite3_reset(count_stmt);
+    update_outbox_full_flag(db);
+
+    // The authoritative signal is the durable capture-gap marker written
+    // by the capture triggers in the overflowing transaction itself.
+    {
+      char gap[64];
+      uint64_t head = 0;
+      if (read_gap_and_seq(db->backup_db, gap, sizeof(gap), &head) == 0 && gap[0])
+        ARK_STORE(&db->capture_paused, 1);  // cleared only by a rebasing snapshot
     }
+    // A manifest held back earlier (gap, interval) is retried here, so a
+    // quiet database still publishes its last chunks.
+    if (ship_ok) manifest_registry_maybe_upload(db);
 
     if (!drained) {
+      // Short poll while writes are flowing (wake signals are coalesced,
+      // so a commit may arrive without its own signal); long poll when idle.
+      long wait_ms = ARK_XCHG(&db->capture_activity, 0) ? 100L : (long)POLL_INTERVAL_MS;
 #ifndef _WIN32
       pthread_mutex_lock(&db->wake_mutex);
       if (!db->wake_flag && !ARK_LOAD(&db->shutdown_requested)) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += POLL_INTERVAL_MS / 1000;
+        ts.tv_sec += wait_ms / 1000;
+        ts.tv_nsec += (wait_ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
         pthread_cond_timedwait(&db->wake_cond, &db->wake_mutex, &ts);
       }
       db->wake_flag = 0;
@@ -2674,7 +2963,7 @@ void *run_wal_flush(void *arg) {
 #else
       EnterCriticalSection(&db->wake_mutex);
       if (!db->wake_flag && !ARK_LOAD(&db->shutdown_requested)) {
-        SleepConditionVariableCS(&db->wake_cond, &db->wake_mutex, POLL_INTERVAL_MS);
+        SleepConditionVariableCS(&db->wake_cond, &db->wake_mutex, (DWORD)wait_ms);
       }
       db->wake_flag = 0;
       LeaveCriticalSection(&db->wake_mutex);
@@ -2682,10 +2971,31 @@ void *run_wal_flush(void *arg) {
     }
   }
 
-  if (db->chunk.entry_count > 0) {
-    wal_chunk_flush_to_s3(db, &db->chunk, delete_stmt);
-    wal_chunk_reset(&db->chunk);
+  // Final drain on shutdown: ship what is buffered, then publish the
+  // manifest immediately (bypassing the batching interval) so a clean
+  // shutdown never leaves its last chunks unreachable by restore.
+  if (ARK_LOAD(&db->backup_enabled) && ARK_LOAD(&db->s3_creds_loaded) &&
+      ARK_LOAD(&db->manifest_seed_resolved) == 1 && select_stmt) {
+    int budget = get_env_int_default("ARKILIAN_SHUTDOWN_DRAIN_SEC", 10);
+    if (budget < 0) budget = 0;
+    if (budget > 600) budget = 600;
+    t_drain_deadline = budget > 0 ? time(NULL) + budget : 0;
+    // Fill whole chunks (drain_chunk moves at most BATCH_SIZE rows per
+    // call) and ship until the outbox is empty or the budget runs out —
+    // a fixed pass count capped the tail at a few thousand rows.
+    while (budget > 0 && time(NULL) < t_drain_deadline) {
+      int n = drain_chunk(db, &db->chunk, select_stmt);
+      int full = db->chunk.len >= CHUNK_MAX_SIZE_BYTES ||
+                 db->chunk.entry_count >= CHUNK_MAX_ENTRIES;
+      if (n > 0 && !full) continue;            // keep filling this chunk
+      if (db->chunk.entry_count == 0) break;   // outbox empty
+      if (wal_chunk_flush_to_s3(db, &db->chunk, delete_stmt) != SHIP_OK) break;
+      wal_chunk_reset(&db->chunk);
+    }
+    if (budget > 0 && time(NULL) < t_drain_deadline) manifest_registry_publish(db, 1);
+    t_drain_deadline = 0;
   }
+  wal_chunk_reset(&db->chunk);
 
   if (select_stmt) sqlite3_finalize(select_stmt);
   if (delete_stmt) sqlite3_finalize(delete_stmt);
@@ -2989,6 +3299,12 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // (backup + signed-URL request with no sleep in between). Clamp it.
   if (db->backup_interval < 1) db->backup_interval = 1;
   ARK_STORE(&db->backup_enabled, get_env_bool_default("ARKILIAN_ENABLE_BACKUP", 1));
+  {
+    unsigned char rnd[8];
+    sqlite3_randomness((int)sizeof(rnd), rnd);
+    for (int i = 0; i < 8; i++)
+      snprintf(db->writer_id + i * 2, 3, "%02x", rnd[i]);
+  }
   db->chunk_interval = get_env_int_default("ARKILIAN_CHUNK_INTERVAL_SEC",
                                            CHUNK_FLUSH_INTERVAL_SEC);
   if (db->chunk_interval < 1) db->chunk_interval = 1;
@@ -3529,12 +3845,20 @@ static void apply_ddl_capture(arkilian *db, const char *sql) {
   }
   if (terr) sqlite3_free(terr);
 
+  // A DDL that cannot be captured (outbox flagged full) opens a durable
+  // capture gap in the same transaction (db_exec wraps DDL + capture in a
+  // savepoint) instead of vanishing silently.
+  sqlite3_exec(db->handle,
+               "UPDATE _arkilian_meta SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT) "
+               "WHERE k = 'capture_gap' AND EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'outbox_full'); "
+               "INSERT INTO _arkilian_meta (k, v) SELECT 'capture_gap', '1' "
+               "WHERE EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'outbox_full') "
+               "AND NOT EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'capture_gap');",
+               NULL, NULL, NULL);
   sqlite3_stmt *ddl_stmt = NULL;
-  char ddl_insert_sql[160];
-  snprintf(ddl_insert_sql, sizeof(ddl_insert_sql),
+  const char *ddl_insert_sql =
     "INSERT INTO _pending_backup (payload) SELECT ? "
-    "WHERE (SELECT COUNT(*) FROM _pending_backup) < %ld",
-    outbox_cap());
+    "WHERE NOT EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'outbox_full')";
   if (sqlite3_prepare_v2(db->handle, ddl_insert_sql, -1, &ddl_stmt, NULL) == SQLITE_OK) {
     int bind_rc = sqlite3_bind_text(ddl_stmt, 1, sql, -1, SQLITE_TRANSIENT);
     int step_rc = (bind_rc == SQLITE_OK) ? sqlite3_step(ddl_stmt) : bind_rc;
@@ -3606,6 +3930,24 @@ int db_exec(arkilian *db, const char *sql) {
     char *stmt_sql_copy = NULL;
     if (stmt_sql_raw) stmt_sql_copy = strdup(stmt_sql_raw);
 
+    // DDL and its capture row commit atomically. Without this, an
+    // autocommit DDL committed first and its outbox row second, so a
+    // snapshot taken in between contained the table while its baseline
+    // LSN did not cover the DDL — the restore then replayed CREATE/ALTER
+    // onto a schema that already had it and failed.
+    int is_ddl = 0;
+    if (stmt_sql_copy) {
+      const char *v0 = skip_sql_prefix(stmt_sql_copy);
+      is_ddl = strncasecmp(v0, "CREATE", 6) == 0 ||
+               strncasecmp(v0, "ALTER", 5) == 0 ||
+               strncasecmp(v0, "DROP", 4) == 0;
+    }
+    int ddl_sp = 0;
+    if (is_ddl && sqlite3_exec(db->handle, "SAVEPOINT ark_ddl_capture;",
+                               NULL, NULL, NULL) == SQLITE_OK) {
+      ddl_sp = 1;
+    }
+
     // Execute: step until DONE (or ROW for SELECTs which we discard, as
     // sqlite3_exec would). sqlite3_exec uses a callback and discards rows;
     // db_exec historically discards them as well, so we just drain ROWs.
@@ -3625,6 +3967,10 @@ int db_exec(arkilian *db, const char *sql) {
       if (errmsg) sqlite3_free(errmsg);
       errmsg = sqlite3_mprintf("%s", sqlite3_errmsg(db->handle));
       final_rc = step_rc;
+      if (ddl_sp) {
+        sqlite3_exec(db->handle, "ROLLBACK TO ark_ddl_capture;", NULL, NULL, NULL);
+        sqlite3_exec(db->handle, "RELEASE ark_ddl_capture;", NULL, NULL, NULL);
+      }
       free(stmt_sql_copy);
       break;
     }
@@ -3633,13 +3979,18 @@ int db_exec(arkilian *db, const char *sql) {
     // next statement, so "CREATE TABLE t; INSERT INTO t" captures the
     // INSERT, and "ALTER; UPDATE" records in the correct order.
     if (stmt_sql_copy) {
-      const char *verb = skip_sql_prefix(stmt_sql_copy);
-      if (strncasecmp(verb, "CREATE", 6) == 0 ||
-          strncasecmp(verb, "ALTER", 5) == 0 ||
-          strncasecmp(verb, "DROP", 4) == 0) {
-        apply_ddl_capture(db, stmt_sql_copy);
-      }
+      if (is_ddl) apply_ddl_capture(db, stmt_sql_copy);
       free(stmt_sql_copy);
+    }
+    if (ddl_sp) {
+      if (sqlite3_exec(db->handle, "RELEASE ark_ddl_capture;", NULL, NULL, NULL) != SQLITE_OK) {
+        if (errmsg) sqlite3_free(errmsg);
+        errmsg = sqlite3_mprintf("%s", sqlite3_errmsg(db->handle));
+        final_rc = sqlite3_errcode(db->handle);
+        sqlite3_exec(db->handle, "ROLLBACK TO ark_ddl_capture;", NULL, NULL, NULL);
+        sqlite3_exec(db->handle, "RELEASE ark_ddl_capture;", NULL, NULL, NULL);
+        break;
+      }
     }
 
     p = tail;
@@ -3949,6 +4300,12 @@ const char *db_wal_last_sql(arkilian *db) {
 
 void db_wal_flush(arkilian *db) {
   if (!db) return;
+  // A flush cannot happen while shipping is frozen: say why, synchronously
+  // on the caller's thread (freeze_reason is written before the frozen
+  // state is published, and never changes afterwards).
+  if (ARK_LOAD(&db->manifest_seed_resolved) == -1 && db->freeze_reason[0])
+    ark_log(db, ARK_LOG_ERROR, "flush requested but shipping is frozen: %s",
+            db->freeze_reason);
 #ifndef _WIN32
   pthread_mutex_lock(&db->wake_mutex);
   db->wake_flag = 1;
@@ -4008,7 +4365,8 @@ long long db_backup_oldest_pending_age_sec(arkilian *db) {
   sqlite3_stmt *stmt = NULL;
   long long age = 0;
   if (sqlite3_prepare_v2(db->handle,
-        "SELECT strftime('%s','now') - MIN(created_at) FROM _pending_backup",
+        "SELECT strftime('%s','now') - created_at FROM _pending_backup "
+        "ORDER BY id LIMIT 1",
         -1, &stmt, NULL) == SQLITE_OK) {
     if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
       age = sqlite3_column_int64(stmt, 0);
@@ -4116,7 +4474,7 @@ unsigned db_backup_health_flags(arkilian *db) {
   if (ARK_LOAD(&db->manifest_seed_resolved) == 1) f |= ARK_HF_MANIFEST_RESOLVED;
   // Sticky "CDC rows were dropped at the cap" or sidecar I/O failure signal —
   // a gap occurred; healthy must wait for the snapshot that closes it.
-  if (!ARK_LOAD(&db->capture_paused) && !ARK_LOAD(&db->sidecar_io_error)) f |= ARK_HF_NO_CAPTURE_GAP;
+  if (!db_backup_capture_paused(db) && !ARK_LOAD(&db->sidecar_io_error)) f |= ARK_HF_NO_CAPTURE_GAP;
   // Informational: capture outbox durability mode (FULL vs NORMAL). Does
   // NOT gate the boolean — NORMAL is an operator choice, not a fault.
   if (db->outbox_durable) f |= ARK_HF_DURABLE_CAPTURE;
@@ -4240,7 +4598,29 @@ int db_get_auto_resync_triggers(arkilian *db) {
 // for disabled/dest-down/thread-dead/cap); this is the specific "CDC rows
 // are being dropped" signal.
 int db_backup_capture_paused(arkilian *db) {
-  return (db && ARK_LOAD(&db->capture_paused)) ? 1 : 0;
+  if (!db) return 0;
+  // Read the durable marker directly so the signal is immediate (the
+  // flush thread's poll can lag by a cycle). Falls back to the cached flag.
+  // A single autocommit SELECT: never BEGIN/COMMIT on the application
+  // connection here (its trace hook treats an explicit BEGIN as the start
+  // of an application transaction for the DDL sidecar).
+  if (db->handle) {
+    sqlite3_stmt *st = NULL;
+    int present = 0;
+    if (sqlite3_prepare_v2(db->handle,
+          "SELECT 1 FROM _arkilian_meta WHERE k IN ('capture_gap', 'outbox_full')",
+          -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW)
+      present = 1;
+    sqlite3_finalize(st);
+    if (present) {
+      ARK_STORE(&db->capture_paused, 1);
+      return 1;
+    }
+  }
+  // Sticky flag: also raised by sidecar I/O failures and deferred publishes;
+  // cleared only when a snapshot that covers the gap publishes.
+  return ARK_LOAD(&db->capture_paused) ? 1 : 0;
 }
 
 int db_backup_unpersisted_count(arkilian *db) {
@@ -4818,9 +5198,15 @@ static void manifest_registry_prune_upto(arkilian *db, uint64_t baseline_lsn) {
 // Returns 0 on success. Manifest publication is the transactional commit
 // point: the registry itself and capture_paused are untouched on failure —
 // preserving full local state so a later flush or snapshot retries safely.
+// publish_upto: only chunk records whose lsn_end <= publish_upto are
+// published (UINT64_MAX = all). Callers pass the LSN head they read in the
+// same transaction as the capture-gap check, so a chunk carrying rows of a
+// transaction committed after that check (which might be torn) can never
+// reach the manifest before its own gap check runs.
 static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
                                     const char *snapshot_sha,
-                                    uint64_t baseline_lsn) {
+                                    uint64_t baseline_lsn,
+                                    uint64_t publish_upto) {
   if (!db || !has_direct_s3(db)) return -1;
   if (!db->s3_prefix || !db->s3_prefix[0]) return -1;
   if (strstr(db->s3_prefix, "..") || db->s3_prefix[0] == '/') return -1;
@@ -4865,11 +5251,18 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
                         prefix_json, skey_json, ssha_json,
                         (long long)cand_baseline) != 0;
   int chunks_written = 0;
+  int held_back = 0;
   for (int i = 0; !bad && i < db->manifest_chunk_count; i++) {
     ark_manifest_chunk *rec = &db->manifest_chunks[i];
     if (snapshot_key && rec->lsn_end <= cand_baseline) {
       // Covered by candidate snapshot baseline: omitted from manifest JSON
       continue;
+    }
+    if (rec->lsn_end > publish_upto) {
+      // Beyond the gap-checked head: held back (contiguity preserved —
+      // records are in LSN order, so everything after is held back too).
+      held_back = 1;
+      break;
     }
     char *k = json_escape_str(rec->s3_key);
     char *s = json_escape_str(rec->sha256 ? rec->sha256 : "");
@@ -5017,7 +5410,7 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
       // The new baseline covers the capture gap: clear sticky gap flag.
       ARK_STORE(&db->capture_paused, 0);
     }
-    db->manifest_pending = 0;
+    db->manifest_pending = held_back ? 1 : 0;
     db->manifest_last_upload = time(NULL);
   }
   free(cand_nk);
@@ -5036,7 +5429,7 @@ static int manifest_interval_sec(void) {
                               MANIFEST_UPLOAD_MIN_INTERVAL_SEC);
   return v < 1 ? 1 : v;
 }
-static void manifest_registry_maybe_upload(arkilian *db) {
+static void manifest_registry_publish(arkilian *db, int force) {
   manifest_registry_lock(db);
   int pending = db->manifest_pending;
   time_t last = db->manifest_last_upload;
@@ -5044,8 +5437,24 @@ static void manifest_registry_maybe_upload(arkilian *db) {
   if (pending <= 0) return;
   time_t now = time(NULL);
   int interval = manifest_interval_sec();
-  if (last != 0 && now - last < interval) return;
-  manifest_registry_upload(db, NULL, NULL, 0);
+  if (!force && last != 0 && now - last < interval) return;
+  // Capture-gap gate: while a gap marker exists the chunk stream is not a
+  // faithful history (some captured transaction may be torn), so no new
+  // restore point is published until a snapshot rebases. The marker and
+  // the LSN head are read in one transaction; only chunks at or below
+  // that head are eligible.
+  char gap[64];
+  uint64_t head = 0;
+  if (read_gap_and_seq(db->backup_db, gap, sizeof(gap), &head) != 0) return;
+  if (gap[0]) {
+    ARK_STORE(&db->capture_paused, 1);
+    return;
+  }
+  manifest_registry_upload(db, NULL, NULL, 0, head);
+}
+
+static void manifest_registry_maybe_upload(arkilian *db) {
+  manifest_registry_publish(db, 0);
 }
 
 // Seed the registry from the last uploaded manifest (restart safety): a
@@ -5075,19 +5484,82 @@ static int manifest_registry_seed(arkilian *db) {
     return 0;
   }
   if (!db->s3_prefix || !db->s3_prefix[0]) return 1;
+  // SSRF guard before any network I/O: an endpoint that is not an allowed
+  // storage destination freezes shipping (rows stay in the local outbox).
+  if (!url_is_allowed_storage(db->s3_endpoint)) {
+    freeze_shipping(db,
+            "storage endpoint refused: host is not an allowed storage "
+            "destination (SSRF guard): %.200s — set ARKILIAN_STORAGE_HOSTS "
+            "to allow it", db->s3_endpoint);
+    return 1;
+  }
   HydratePlan plan;
   int rc = ark_manifest_fetch(db->s3_endpoint, db->s3_bucket, db->s3_region,
                               db->s3_access_key, db->s3_secret_key,
                               db->s3_prefix, &plan);
+  // Operator override (ARKILIAN_MANIFEST_REBASE=1): this database is the
+  // authority for the prefix. The remote registry is ignored, and a
+  // capture-gap marker withholds every manifest until a fresh snapshot of
+  // THIS database publishes and replaces it.
+  const char *rebase = getenv("ARKILIAN_MANIFEST_REBASE");
+  int rebase_on = rebase && strcmp(rebase, "1") == 0;
+  if (rc == 0 || rc == HYDRATION_ERR_PROTO) {
+    if (rebase_on) {
+      if (rc == 0) hydrate_plan_free(&plan);
+      if (sqlite3_exec(db->backup_db, ARK_GAP_MARK_SQL ";", NULL, NULL, NULL) != SQLITE_OK)
+        return 0;  // retried
+      ark_log(db, ARK_LOG_WARN,
+              "ARKILIAN_MANIFEST_REBASE=1: ignoring the existing remote manifest "
+              "for prefix %s; restores resume after the next snapshot publishes",
+              db->s3_prefix);
+      ARK_STORE(&db->manifest_seed_resolved, 1);
+      return 1;
+    }
+  }
   if (rc != 0) {
     if (rc == HYDRATION_ERR_NOTFOUND) {
       ARK_STORE(&db->manifest_seed_resolved, 1);  // cold start, nothing to adopt
     } else if (rc == HYDRATION_ERR_PROTO) {
-      ARK_STORE(&db->manifest_seed_resolved, -1); // frozen; see comment above
+      freeze_shipping(db,
+              "remote manifest for prefix %s is unreadable — shipping and "
+              "publishing frozen (set ARKILIAN_MANIFEST_REBASE=1 to make this "
+              "database the authority)", db->s3_prefix);
     } else {
       return 0; // transient (net/mem) — retried by the flush loop
     }
     return 1;
+  }
+
+  // Split-brain / un-restored-node guard: the remote history must not be
+  // ahead of this database. Every LSN the manifest references was assigned
+  // by the writer of this prefix; if the remote head exceeds the highest
+  // LSN this database ever assigned, then either another live writer owns
+  // the prefix or this database was not restored from it. Continuing would
+  // publish an interleaved history that no restore can replay.
+  {
+    uint64_t remote_head = plan.baseline_lsn > 0 ? (uint64_t)plan.baseline_lsn : 0;
+    for (int i = 0; i < plan.chunk_count; i++)
+      if ((uint64_t)plan.chunks[i].lsn_end > remote_head)
+        remote_head = (uint64_t)plan.chunks[i].lsn_end;
+    char gap_unused[64];
+    uint64_t local_head = 0;
+    if (read_gap_and_seq(db->backup_db, gap_unused, sizeof(gap_unused), &local_head) != 0) {
+      hydrate_plan_free(&plan);
+      return 0;  // transient; retried
+    }
+    if (remote_head > local_head) {
+      freeze_shipping(db,
+              "remote manifest for prefix %s is AHEAD of this database (remote "
+              "LSN %llu > local LSN %llu): another writer is using this prefix, "
+              "or this database was not restored from it. Shipping and "
+              "publishing are frozen. Restore with arkilian_hydrate_s3(), use a "
+              "different ARKILIAN_S3_PREFIX, or set ARKILIAN_MANIFEST_REBASE=1 "
+              "to make this database the authority.",
+              db->s3_prefix, (unsigned long long)remote_head,
+              (unsigned long long)local_head);
+      hydrate_plan_free(&plan);
+      return 1;
+    }
   }
   manifest_registry_lock(db);
   for (int i = 0; i < plan.chunk_count; i++) {
@@ -5139,24 +5611,25 @@ int arkilian_registry_record(arkilian *db, const char *s3_key,
   return 0;
 }
 
-// One snapshot attempt: heartbeat → capture pruning watermark → copy →
-// upload → prune + publish. Extracted from the hourly loop so the
-// watermark/copy ordering is directly testable.
+// One snapshot attempt: heartbeat → exact baseline + copy in one read
+// transaction → upload under a unique key → gap re-check → publish →
+// clear the capture gap the image absorbed. Extracted from the hourly
+// loop so the baseline invariant is directly testable.
 //
-// ── P0 correctness note (snapshot-baseline invariant) ────────────────
-// The baseline LSN published with a snapshot MUST be captured BEFORE the
-// copy starts. The previous code read it from the (mutable) manifest
-// registry AFTER backup_database() returned — while claiming in its own
-// comment that it was "the highest chunk LSN flushed before the copy
-// began". A chunk shipped during the copy (the normal case under
-// continuous writes) would be declared "contained in the snapshot",
-// pruned from the registry, and then skipped by hydration — a silent
-// restore gap. The copy's image is guaranteed to contain every change
-// committed BEFORE it started (sqlite3_backup_step restarts on source
-// modification, so the image is some state in [copy-start, copy-end]);
-// only a pre-copy watermark is sound.
+// ── Snapshot-baseline invariant ──────────────────────────────────────
+// The published baseline is EXACTLY the image's position in the LSN
+// stream: the image contains every captured change with LSN <= baseline
+// and none above it. Both are read in one read transaction on the
+// snapshot connection (sqlite_sequence for the outbox = highest LSN ever
+// assigned; the copy runs inside the same transaction). Hydration skips
+// statements at or below the baseline (per-statement LSN tags), so a
+// chunk that straddles the baseline neither loses changes nor re-applies
+// DDL the image already contains. (Earlier releases used the highest
+// registered chunk LSN, which sat below the image's true position and
+// made restores re-run CREATE/ALTER statements and fail.)
 int arkilian_run_snapshot_cycle(arkilian *db) {
   if (!db || !db->is_open || !db->handle) return -1;
+  ARK_STORE(&db->snapshot_published, 0);
   // Kill-switch: skip the snapshot + upload entirely while disabled.
   if (!ARK_LOAD(&db->backup_enabled)) return 0;
 
@@ -5164,73 +5637,164 @@ int arkilian_run_snapshot_cycle(arkilian *db) {
   // thread is visible via db_backup_snapshot_heartbeat_age_ms().
   ARK_STORE(&db->last_snapshot_heartbeat_sec, (int)(now_ms_mono() / 1000));
 
-  // ── Watermark FIRST (the fix): highest registered chunk LSN, floored by
-  // the previously published baseline so a later snapshot never
-  // REPUBLISHES a LOWER baseline over a durable higher one.
+  // Never snapshot over a registry this process has not yet read: the
+  // publish would be refused anyway. The snapshot loop retries shortly.
+  if (has_direct_s3(db) && ARK_LOAD(&db->manifest_seed_resolved) != 1)
+    return SQLITE_BUSY;
+
+  // ── Exact baseline (P0 fix) ──────────────────────────────────────────
+  // The copy runs inside ONE read transaction on the snapshot connection,
+  // and the baseline is read in that same transaction: the highest LSN
+  // ever assigned (sqlite_sequence for _pending_backup). Every captured
+  // change with LSN <= baseline is in the image and none above it is, so
+  // hydration replays exactly the statements after the baseline (chunks
+  // carry per-statement LSN tags). The previous watermark ("highest
+  // registered chunk") was below the image's true position, so restore
+  // replayed already-applied DDL and failed.
+  // The capture-gap marker is read in the same transaction: a gap the
+  // image has already absorbed is cleared once this snapshot publishes.
+  char gap_at_copy[64];
   uint64_t snapshot_upto = 0;
-  manifest_registry_lock(db);
-  for (int i = 0; i < db->manifest_chunk_count; i++) {
-    if (db->manifest_chunks[i].lsn_end > snapshot_upto)
-      snapshot_upto = db->manifest_chunks[i].lsn_end;
+  if (sqlite3_exec(db->snapshot_db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK)
+    return SQLITE_BUSY;
+  if (read_gap_and_seq(db->snapshot_db, gap_at_copy, sizeof(gap_at_copy),
+                       &snapshot_upto) != 0) {
+    sqlite3_exec(db->snapshot_db, "ROLLBACK;", NULL, NULL, NULL);
+    return SQLITE_ERROR;
   }
-  if (db->manifest_baseline_lsn > snapshot_upto)
-    snapshot_upto = db->manifest_baseline_lsn;
-  manifest_registry_unlock(db);
 
   // Snapshot from the SNAPSHOT connection (this thread's own, spec
-  // §3.1) — never the game connection: sqlite3_backup_step page I/O
-  // would otherwise hold the game connection's mutex for the whole
-  // copy, making game-thread writes wait on the backup thread (the
-  // exact §3.3 failure mode the spec forbids). Sharing the flush
-  // thread's connection would stall shipping during large snapshots.
-  int status = arkilian_snapshot_copy_hook
-      ? arkilian_snapshot_copy_hook(db->snapshot_db, db->backup_path,
-                                    &db->shutdown_requested)
-      : backup_database(db->snapshot_db, db->backup_path,
-                        &db->shutdown_requested);
-
-  // Upload path: the ONLY destination is S3-compatible object storage,
-  // signed locally with the configured credentials.
-  if (status == SQLITE_OK && has_direct_s3(db)) {
-    // Compute sha256 of the backup file — the manifest records it so
-    // hydration authenticates the object before installing it.
-    char snap_sha256[65] = {0};
-    (void)ark_sha256_hex_file(db->backup_path, snap_sha256);
-
-    char s3_key[512];
-    snprintf(s3_key, sizeof(s3_key), "%s/backup.sqlite", db->s3_prefix);
-
-    char *upload_url = s3_presign_put(db, s3_key, 3600L);
-    if (!upload_url) {
-      ark_log(db, ARK_LOG_ERROR,
-              "snapshot upload skipped: local SigV4 signing failed");
-    } else if (upload_to_s3(db, upload_url, db->backup_path) != 0) {
-      ark_log(db, ARK_LOG_ERROR, "scheduled backup upload failed");
-      free(upload_url);
-    } else {
-      free(upload_url);
-      // Baseline + prune + publish: manifest publication is the commit point.
-      // On success, manifest_registry_upload commits the in-memory registry,
-      // prunes chunks covered by snapshot_upto, and clears capture_paused.
-      // On failure, the in-memory registry and capture_paused remain untouched
-      // so the gap stays asserted and the publish can be retried safely.
-      if (snap_sha256[0]) {
-        if (manifest_registry_upload(db, s3_key, snap_sha256,
-                                     snapshot_upto) != 0) {
-          // Loud, every occurrence: a failed publish means remote
-          // restores silently stay on the previous manifest while
-          // shipping continues. Not a reason to stop shipping — but
-          // never a quiet one.
-          ark_log(db, ARK_LOG_ERROR,
-                  "snapshot manifest publish failed (baseline %llu) — "
-                  "remote restores remain on the previous manifest until "
-                  "a publish succeeds",
-                  (unsigned long long)snapshot_upto);
-        }
-      }
+  // §3.1) — never the game connection. The open read transaction pins
+  // the image to the instant the baseline was read.
+  // Stage into a unique, owner-only file: a fixed staging path is shared
+  // by every instance with the same ARKILIAN_BACKUP_PATH (the default is
+  // ./backup.sqlite), and two instances overwrote each other's image
+  // between copy, hash and upload. The finished copy is renamed onto
+  // backup_path at the end (the documented local copy).
+  char stage[1200];
+  {
+    FILE *sf = arkilian_unique_tmp(db->backup_path, "snapshot", stage, sizeof(stage));
+    if (!sf) {
+      sqlite3_exec(db->snapshot_db, "ROLLBACK;", NULL, NULL, NULL);
+      ark_log(db, ARK_LOG_ERROR, "snapshot staging file could not be created");
+      return SQLITE_CANTOPEN;
     }
+    fclose(sf);  // an empty file is a valid empty SQLite database
+  }
+  int status = arkilian_snapshot_copy_hook
+      ? arkilian_snapshot_copy_hook(db->snapshot_db, stage,
+                                    &db->shutdown_requested)
+      : backup_database(db->snapshot_db, stage, &db->shutdown_requested);
+  sqlite3_exec(db->snapshot_db, "COMMIT;", NULL, NULL, NULL);
+
+  int up = (status == SQLITE_OK && has_direct_s3(db))
+               ? snapshot_upload_and_publish(db, stage, snapshot_upto, gap_at_copy)
+               : 0;
+  (void)up;
+  if (status == SQLITE_OK) {
+#ifdef _WIN32
+    remove(db->backup_path);  // rename() does not replace on Windows
+#endif
+    if (rename(stage, db->backup_path) != 0) unlink(stage);
+  } else {
+    unlink(stage);
   }
   return status;
+}
+
+// Upload the staged image, then (gap-checked) publish it as the new
+// baseline. Returns 0 when the manifest was published.
+static int snapshot_upload_and_publish(arkilian *db, const char *stage,
+                                       uint64_t snapshot_upto,
+                                       const char *gap_at_copy) {
+  manifest_registry_lock(db);
+  uint64_t published_baseline = db->manifest_baseline_lsn;
+  manifest_registry_unlock(db);
+  if (snapshot_upto < published_baseline) {
+    ark_log(db, ARK_LOG_ERROR,
+            "snapshot baseline %llu is below the published baseline %llu — "
+            "this database is behind the backup it would overwrite; refusing "
+            "to publish",
+            (unsigned long long)snapshot_upto,
+            (unsigned long long)published_baseline);
+    return -1;
+  }
+
+  char snap_sha256[65] = {0};
+  if (ark_sha256_hex_file(stage, snap_sha256) != 0 || !snap_sha256[0]) {
+    ark_log(db, ARK_LOG_ERROR, "snapshot hashing failed — not published");
+    return -1;
+  }
+
+  // Unique, immutable snapshot key per cycle. Overwriting one fixed key
+  // broke the previous manifest whenever a new publish failed (its digest
+  // no longer matched the replaced object) and left no restore history.
+  char s3_key[512];
+  snprintf(s3_key, sizeof(s3_key), "%s/snapshots/%020llu_%s.backup.sqlite",
+           db->s3_prefix, (unsigned long long)snapshot_upto, db->writer_id);
+
+  char *upload_url = s3_presign_put(db, s3_key, 3600L);
+  if (!upload_url) {
+    ark_log(db, ARK_LOG_ERROR,
+            "snapshot upload skipped: local SigV4 signing failed");
+    return -1;
+  }
+  int up_rc = upload_to_s3(db, upload_url, stage);
+  free(upload_url);
+  if (up_rc != 0) {
+    ark_log(db, ARK_LOG_ERROR, "scheduled backup upload failed");
+    return -1;
+  }
+
+  // Re-check the gap marker immediately before publishing. A gap opened
+  // AFTER the image was taken is not covered by it, and chunks after the
+  // baseline may carry that torn transaction: defer to the next cycle.
+  char gap_now[64];
+  uint64_t head_now = 0;
+  if (read_gap_and_seq(db->snapshot_db, gap_now, sizeof(gap_now), &head_now) != 0) {
+    ark_log(db, ARK_LOG_ERROR, "snapshot publish deferred: gap check failed");
+    return -1;
+  }
+  if (strcmp(gap_now, gap_at_copy) != 0) {
+    ark_log(db, ARK_LOG_WARN,
+            "snapshot publish deferred: a capture gap opened during the "
+            "snapshot (outbox at capacity); the next cycle rebases");
+    ARK_STORE(&db->capture_paused, 1);
+    return -1;
+  }
+
+  // Baseline + prune + publish: manifest publication is the commit point.
+  if (manifest_registry_upload(db, s3_key, snap_sha256, snapshot_upto,
+                               head_now) != 0) {
+    ark_log(db, ARK_LOG_ERROR,
+            "snapshot manifest publish failed (baseline %llu) — "
+            "remote restores remain on the previous manifest until "
+            "a publish succeeds",
+            (unsigned long long)snapshot_upto);
+    return -1;
+  }
+  ARK_STORE(&db->snapshot_published, 1);
+
+  // The published image absorbed the gap it observed: clear exactly that
+  // marker value (a newer gap, if any, keeps a different value and stays).
+  if (gap_at_copy[0]) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db->snapshot_db,
+          "DELETE FROM _arkilian_meta WHERE k = 'capture_gap' AND v = ?",
+          -1, &st, NULL) == SQLITE_OK) {
+      sqlite3_bind_text(st, 1, gap_at_copy, -1, SQLITE_TRANSIENT);
+      if (sqlite3_step(st) != SQLITE_DONE)
+        ark_log(db, ARK_LOG_WARN, "capture gap clear failed: %s",
+                sqlite3_errmsg(db->snapshot_db));
+    }
+    sqlite3_finalize(st);
+  }
+  char gap_after[64];
+  uint64_t ignored = 0;
+  if (read_gap_and_seq(db->snapshot_db, gap_after, sizeof(gap_after), &ignored) == 0 &&
+      gap_after[0])
+    ARK_STORE(&db->capture_paused, 1);  // a newer gap is still open
+  return 0;
 }
 
 #ifdef _WIN32
@@ -5243,6 +5807,7 @@ void *run_hourly_backup(void *arg) {
   // The wait is interruptible so db_close() never blocks on a sleeping
   // backup interval (previously close could hang for up to an hour).
   time_t next_backup = time(NULL);
+  long retry_s = 0;
 
   while (1) {
 #ifndef _WIN32
@@ -5277,7 +5842,28 @@ void *run_hourly_backup(void *arg) {
     // arkilian_run_snapshot_cycle() so the baseline invariant is directly
     // testable (tests/test_snapshot_watermark.c drives the real cycle
     // with a copy hook that ships a chunk mid-copy).
-    (void)arkilian_run_snapshot_cycle(db);
+    int cyc_rc = arkilian_run_snapshot_cycle(db);
+    if (cyc_rc == SQLITE_BUSY && has_direct_s3(db) &&
+        ARK_LOAD(&db->manifest_seed_resolved) == 0) {
+      // Startup: the manifest read has not resolved yet — check again
+      // shortly so the first snapshot follows it closely.
+      next_backup = time(NULL) + 1;
+      continue;
+    }
+
+    // A cycle that did not reach a published manifest (seed not yet
+    // resolved, upload/publish failure, or a gap that opened mid-copy) is
+    // retried on a short bounded backoff instead of waiting a full
+    // interval: until a snapshot publishes, restores stay on an older
+    // restore point (or, with a capture gap open, no newer one exists).
+    if (ARK_LOAD(&db->backup_enabled) && has_direct_s3(db) &&
+        !ARK_LOAD(&db->snapshot_published)) {
+      if (retry_s < 15) retry_s = 15; else if (retry_s < 600) retry_s *= 2;
+      long wait = retry_s < db->backup_interval ? retry_s : db->backup_interval;
+      next_backup = time(NULL) + wait;
+    } else {
+      retry_s = 0;
+    }
   }
 #ifdef _WIN32
   return 0;

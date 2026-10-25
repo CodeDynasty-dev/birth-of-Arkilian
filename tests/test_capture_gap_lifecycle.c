@@ -141,6 +141,10 @@ static void test_capture_gap_successful_recovery(void) {
   assert(db_backup_capture_paused(db) == 0);
 
   // 1. Induce remote S3 outage: PUTs fail with 500
+  // The startup snapshot publishes first (it is retried until it does);
+  // only then is the outage induced, so no automatic snapshot can land
+  // inside the window this test controls (BACKUP_INTERVAL is huge).
+  assert(stub_manifest_contains("backup.sqlite", 30));
   stub_set_status_override_put(500);
 
   // 2. Fill queue to cap 10
@@ -231,6 +235,10 @@ static void test_capture_gap_manifest_failure_and_retry(void) {
   assert(db_exec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)") == SQLITE_OK);
 
   // 1. Induce S3 outage: PUTs fail
+  // The startup snapshot publishes first (it is retried until it does);
+  // only then is the outage induced, so no automatic snapshot can land
+  // inside the window this test controls (BACKUP_INTERVAL is huge).
+  assert(stub_manifest_contains("backup.sqlite", 30));
   stub_set_status_override_put(500);
 
   // 2. Fill queue to cap 10
@@ -328,6 +336,10 @@ static void test_capture_gap_sig_failure_and_retry(void) {
   assert(db_exec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)") == SQLITE_OK);
 
   // 1. Induce S3 outage: PUTs fail
+  // The startup snapshot publishes first (it is retried until it does);
+  // only then is the outage induced, so no automatic snapshot can land
+  // inside the window this test controls (BACKUP_INTERVAL is huge).
+  assert(stub_manifest_contains("backup.sqlite", 30));
   stub_set_status_override_put(500);
 
   // 2. Fill queue to cap 10

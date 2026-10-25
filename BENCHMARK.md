@@ -1,5 +1,28 @@
 # Arkilian Performance Benchmark Report
 
+> **Status (v1.6.0): the figures further below are superseded and should not
+> be quoted.** They were measured on a macOS laptop with
+> `ARKILIAN_ENABLE_BACKUP=0`, where fsync dominated both sides and hid the
+> capture cost, and the latency percentiles were histogram bucket edges.
+>
+> **Current numbers** (`bench/bench_cmp.c`: raw SQLite vs Arkilian with
+> capture on, prepared statements, identical pragmas, outbox drained outside
+> the timed region; Linux x86-64 VM, 4 vCPU; median of 3):
+>
+> | Workload | SQLite | Arkilian 1.5.0 | Arkilian 1.6.0 |
+> | --- | --- | --- | --- |
+> | INSERT autocommit, `synchronous=NORMAL` | 51,404/s | 7,070/s (7.3x) | 16,264/s (3.2x) |
+> | INSERT, 1000/txn, `NORMAL` | 571,455 rows/s | 10,009 (57x) | 45,587 (12.5x) |
+> | UPDATE autocommit, `NORMAL` | 76,273/s | 16,624 (4.6x) | 30,516 (2.5x) |
+> | Point SELECT | 252,031/s | 229,039 (1.1x) | 228,139 (1.1x) |
+> | INSERT autocommit, `synchronous=FULL` (default) | 1,582/s | 1,078 (1.5x) | 1,273 (1.2x) |
+> | INSERT, 1000/txn, `FULL` | 357,456 rows/s | 9,777 (37x) | 40,455 (8.8x) |
+>
+> Single-row writes with the default `synchronous=FULL` are dominated by
+> fsync, so capture adds ~20%; in large transactions the per-row capture work
+> (an outbox row carrying replay SQL) dominates. Run `bash bench/minio/run.sh`
+> for the same comparison plus an end-to-end run against MinIO.
+
 **Benchmark Suite:** `tests/bench_1m.c`  
 **Test Hardware:** Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz, 6 Cores / 12 Threads, macOS 24.6.0  
 **Target Database:** SQLite 3.46.1 (amalgamation)  

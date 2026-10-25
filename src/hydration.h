@@ -150,6 +150,11 @@ int arkilian_hydrate_s3(const char *db_path,
 // Returns 0 on success, negative on error.
 int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn);
 
+// As hydrate_replay_chunk, but statements tagged "/*lsn:N*/" with
+// N <= skip_upto are skipped (already contained in the restored image).
+int hydrate_replay_chunk_ex(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn,
+                            int64_t skip_upto);
+
 // Free all memory associated with a HydratePlan.
 void hydrate_plan_free(HydratePlan *plan);
 

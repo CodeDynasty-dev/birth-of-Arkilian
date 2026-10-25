@@ -16,10 +16,10 @@ Arkilian is an embedded SQLite database engine written in C99 that streams row-l
 
 ### Features
 * **Asynchronous CDC Streaming:** Batches row-level changes from a local outbox (`_pending_backup`) into SHA-256-verified SQL chunks uploaded via AWS SigV4 presigned PUTs.
-* **Point-in-Time Snapshots:** Periodic online database backups (`sqlite3_backup_step`) uploaded to S3 (`backup.sqlite`).
+* **Snapshots:** Periodic online database backups (`sqlite3_backup_step`) uploaded to S3 under an immutable, per-cycle key (`{prefix}/snapshots/<baseline-lsn>_<writer>.backup.sqlite`), each pinned to its exact LSN.
 * **Cold-Start Hydration:** Reconstructs the database from S3 (`manifest.json`, baseline snapshot, and incremental chunks) with HMAC-SHA256 and SHA-256 verification.
 * **Dedicated Connections:** Three independent SQLite connections (`handle`, `backup_db`, and `snapshot_db`) eliminate cross-thread lock contention (Spec §3.1).
-* **Non-Blocking Capture:** If the outbox exceeds capacity (`ARKILIAN_MAX_QUEUE_DEPTH`, default 100,000), CDC capture pauses while application writes proceed without blocking (Spec §0).
+* **No Silent Capture Loss:** If the outbox reaches capacity (`ARKILIAN_MAX_QUEUE_DEPTH`, default 100,000), application writes proceed and a durable *capture-gap marker* is written in the same transaction; health turns RED and no new restore point is published until a snapshot rebases the backup. Strict mode (`ARKILIAN_CAPTURE_OVERFLOW=abort`) fails the write instead.
 * **Multi-Language SDKs:** Prebuilt bindings for Node.js/TypeScript (N-API), Python (CFFI), Go (cgo), Rust, PHP (FFI), and C/C++.
 
 
@@ -95,6 +95,9 @@ Arkilian reads configuration from process environment variables or a `./.env` fi
 | `ARKILIAN_MANIFEST_HMAC_KEY` | *(empty)* | Secret key for HMAC-SHA256 **manifest authentication**. REQUIRED for manifest publishing and cold-start hydration (fail closed) |
 | `ARKILIAN_ALLOW_INSECURE` | `0` | Set `1` to allow cleartext `http://` endpoints for non-loopback hosts during development |
 | `ARKILIAN_STORAGE_HOSTS` | *(empty)* | Comma-separated allowlist of custom storage hostnames to prevent SSRF vulnerabilities |
+| `ARKILIAN_CAPTURE_OVERFLOW` | *(empty)* | `abort` = strict mode: a write that cannot be captured because the outbox is full fails (`SQLITE_CONSTRAINT`) instead of opening a capture gap |
+| `ARKILIAN_MANIFEST_REBASE` | `0` | `1` makes this database the authority for its prefix: an unreadable or ahead-of-local remote manifest is ignored and restores resume after the next snapshot publishes. Use only after confirming no other writer uses the prefix |
+| `ARKILIAN_SHUTDOWN_DRAIN_SEC` | `10` | Time budget for `db_close()` to ship buffered chunks and publish the final manifest (0 disables the shutdown drain) |
 
 Example `.env` file:
 ```ini
@@ -411,9 +414,13 @@ Full benchmark report, batched scalability curves, memory RSS telemetry, and rep
 ---
 
 ## Architectural Guarantees
-
 * **Ordering:** CDC outbox rows are shipped in strict `_pending_backup` sequence order (LSN order). Any transient S3 network error halts the drain and triggers retries with exponential backoff so changes are never uploaded out of order.
-* **Delivery:** At-least-once. If an upload completes but the local outbox deletion is interrupted by crash or power loss, rows are safely re-shipped in a subsequent chunk. Replay statements use idempotent SQL (`REPLACE INTO ...` and `DELETE FROM ...`), making replay of overlapping ranges completely safe.
+* **Delivery:** At-least-once. If an upload completes but the local outbox deletion is interrupted by crash or power loss, rows are safely re-shipped in a subsequent chunk. Replay is idempotent for row changes (`REPLACE INTO ...` / `DELETE FROM ...`, keyed on the PRIMARY KEY; an UPDATE that changes the key also ships a `DELETE` of the old key).
+* **Exact restore points:** Every snapshot is taken inside one read transaction together with its baseline LSN, and every chunk statement carries its LSN (`/*lsn:N*/`). Restore installs the snapshot and replays exactly the statements after its baseline, so DDL is never re-applied and nothing is skipped.
+* **LSN continuity across failover:** A restored database continues the prefix's LSN sequence, so restore → keep writing → restore again works for any number of generations.
+* **Single writer per prefix:** On startup the node compares the remote manifest with its own LSN head. If the remote is ahead (a second writer, or a node that was not restored from the prefix), shipping and publishing freeze and health turns RED instead of interleaving histories. Chunk and snapshot keys also carry a random per-process writer id, so two writers can never overwrite each other's objects.
+* **No torn restore points:** If any change cannot be captured, a capture-gap marker is committed atomically with it, and manifests are withheld until a snapshot taken after the gap publishes (see `ARKILIAN_CAPTURE_OVERFLOW`).
+* **Recovery point:** Chunks ship every `ARKILIAN_CHUNK_INTERVAL_SEC` (default 1 s), but a restore sees what the manifest references, published at most every `ARKILIAN_MANIFEST_INTERVAL_SEC` (default 30 s). The recovery point objective is therefore about the manifest interval plus upload time; a clean `db_close()` publishes immediately. Tables without a PRIMARY KEY are not captured (listed by `db_backup_skipped_table_count`).
 * **Durability:** With `ARKILIAN_OUTBOX_DURABLE=1` (the default), Arkilian configures `PRAGMA synchronous=FULL;` on the application connection so committed outbox records are durably flushed according to SQLite's full-synchronous durability semantics. Operators prioritizing maximum write throughput over power-loss durability can opt in to `ARKILIAN_OUTBOX_DURABLE=0` (`PRAGMA synchronous=NORMAL;`).
 * **Integrity:** Every uploaded chunk and snapshot is content-addressed and digest-verified. The SHA-256 hash is recorded in the manifest, and hydrators strictly verify object content before applying any SQL chunks.
 * **Authenticity:** Manifest publication and hydration require HMAC-SHA256 signing via `ARKILIAN_MANIFEST_HMAC_KEY`. A companion signature `{prefix}/manifest.sig` is stored alongside `{prefix}/manifest.json`. Hydration strictly refuses unauthenticated, missing, or mismatched manifest signatures (fail closed).

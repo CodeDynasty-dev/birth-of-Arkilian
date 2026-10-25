@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.10 FATAL_ERROR)
 
-project(arkilian VERSION 1.5.0 LANGUAGES C)
+project(arkilian VERSION 1.6.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -133,8 +133,13 @@ if(ARKILIAN_BUILD_STATIC)
 endif()
 
 # Examples
-if(ARKILIAN_BUILD_EXAMPLES)
-    add_executable(arkilian_example examples/main.c)
+# The quickstart uses POSIX unistd.h, so it is skipped on MSVC. (The old
+# target pointed at a non-existent examples/main.c, which broke the
+# documented default build on a fresh clone.)
+if(ARKILIAN_BUILD_EXAMPLES AND NOT MSVC)
+    add_executable(arkilian_example examples/c/01_simple_quickstart.c)
+    target_include_directories(arkilian_example PRIVATE examples/c/include examples/c/include/deps/sqlite src/deps/sqlite)
+    target_compile_definitions(arkilian_example PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE $<$<PLATFORM_ID:Darwin>:_DARWIN_C_SOURCE>)
     if(ARKILIAN_BUILD_SHARED)
         target_link_libraries(arkilian_example PRIVATE arkilian)
     else()
@@ -347,6 +352,19 @@ if(ARKILIAN_BUILD_TESTS)
             target_compile_options(test_snapshot_watermark PRIVATE -UNDEBUG)
             target_compile_definitions(test_snapshot_watermark PRIVATE ${ARK_POSIX_DEFS})
             add_test(NAME test_snapshot_watermark COMMAND test_snapshot_watermark)
+
+            # ── P0 replication regressions (2026-10 evaluation) ──
+            # PK-change capture, overflow gap marker + strict mode,
+            # multi-generation failover chain, split-brain guard, and DDL
+            # straddling a snapshot.
+            add_executable(test_p0_replication tests/test_p0_replication.c
+                           src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
+            target_include_directories(test_p0_replication PRIVATE src src/deps/sqlite)
+            target_link_libraries(test_p0_replication PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                                  ${CURL_LIBRARIES} ${ARK_LIBM})
+            target_compile_options(test_p0_replication PRIVATE -UNDEBUG)
+            target_compile_definitions(test_p0_replication PRIVATE ${ARK_POSIX_DEFS})
+            add_test(NAME test_p0_replication COMMAND test_p0_replication)
 
             # ── Manifest wire-protocol + authenticity (P0 regression) ──
             # HMAC sign/verify (shipper + hydrator), digest-mandatory

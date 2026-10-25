@@ -466,6 +466,9 @@ static void run_kill_scenario(int kill_mode) {
   // ids 2..N+1 are the rows. In S3 mode the DDL may be covered by the
   // snapshot baseline rather than a WAL chunk, so we require 2..N+1 and
   // only warn if 1 is missing (still at-least-once for user data).
+  // Stop (join) the recording server BEFORE reading what it received: a
+  // late request still being handled would otherwise race this read.
+  rec_server_stop(&srv);
   id_set dset = make_set(&srv);
   if (!set_has(&dset, 1)) {
     fprintf(stderr, "WARN: DDL row id 1 not in delivered set (snapshot may cover it, delivered %d ids)\n", dset.n);
@@ -483,7 +486,6 @@ static void run_kill_scenario(int kill_mode) {
   }
   free(dset.v);
 
-  rec_server_stop(&srv);
   cleanup(db_path);
 }
 
