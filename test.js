@@ -169,6 +169,24 @@ if (typeof Arkilian.HealthFlags.ALL_CORE !== "number") throw new Error("HealthFl
 if (Arkilian.HydrationErrors.OK !== 0) throw new Error("HydrationErrors.OK should be 0");
 console.log("   OK");
 
+console.log("\n12. all() with maxRows stops at the cap without throwing...");
+await db.exec("CREATE TABLE capped (id INTEGER PRIMARY KEY, v TEXT)");
+for (let i = 0; i < 5; i++) await db.run("INSERT INTO capped (v) VALUES (?)", [String(i)]);
+const firstTwo = db.all("SELECT * FROM capped ORDER BY id", [], 2);
+if (firstTwo.length !== 2) throw new Error(`maxRows=2 returned ${firstTwo.length} rows`);
+if (db.all("SELECT * FROM capped", [], 10).length !== 5) throw new Error("maxRows above row count");
+console.log("   OK");
+
+console.log("\n13. DDL through run() while a statement is still open...");
+db.prepare("SELECT id FROM capped");
+const openIdx = db.stmtCount() - 1;
+db.step();
+await db.run("ALTER TABLE capped ADD COLUMN extra TEXT");
+db.useStmt(openIdx).finalize();
+await db.run("INSERT INTO capped (v, extra) VALUES ('x', 'AFTER_ALTER')");
+if (db.triggersDirty !== false) throw new Error("triggers left stale after wrapped ALTER");
+console.log("   OK");
+
 await db.close();
 cleanupDb(dbPath);
 console.log("\nAll tests passed!");

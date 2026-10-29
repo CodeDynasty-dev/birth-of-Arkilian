@@ -609,8 +609,11 @@ Napi::Value db_all_native(const Napi::CallbackInfo& info) {
   }
 
   int step_rc = SQLITE_OK;
+  bool capped = false;
   while ((step_rc = db_step(dl.db)) == SQLITE_ROW) {
-    if (max_rows > 0 && row_idx >= max_rows) break;
+    // Reaching maxRows is a normal end of the result set, not an error
+    // (previously it threw "another row available").
+    if (max_rows > 0 && row_idx >= max_rows) { capped = true; break; }
     Napi::Object row = Napi::Object::New(env);
     for (int i = 0; i < col_count; i++) {
       int type = db_column_type(dl.db, i);
@@ -642,7 +645,7 @@ Napi::Value db_all_native(const Napi::CallbackInfo& info) {
     results.Set(row_idx++, row);
   }
 
-  if (step_rc != SQLITE_DONE) {
+  if (step_rc != SQLITE_DONE && !capped) {
     std::string msg = db_errmsg(dl.db);
     db_finalize(dl.db);
     Napi::Error::New(env, msg).ThrowAsJavaScriptException();

@@ -387,6 +387,16 @@ if(ARKILIAN_BUILD_TESTS)
             target_compile_options(test_capture_gap_lifecycle PRIVATE -UNDEBUG)
             target_compile_definitions(test_capture_gap_lifecycle PRIVATE ${ARK_POSIX_DEFS})
             add_test(NAME test_capture_gap_lifecycle COMMAND test_capture_gap_lifecycle)
+
+            # ── DDL capture under a concurrent writer (field report) ──
+            add_executable(test_ddl_concurrency tests/test_ddl_concurrency.c
+                           src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
+            target_include_directories(test_ddl_concurrency PRIVATE src src/deps/sqlite)
+            target_link_libraries(test_ddl_concurrency PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                                  ${CURL_LIBRARIES} ${ARK_LIBM})
+            target_compile_options(test_ddl_concurrency PRIVATE -UNDEBUG)
+            target_compile_definitions(test_ddl_concurrency PRIVATE ${ARK_POSIX_DEFS})
+            add_test(NAME test_ddl_concurrency COMMAND test_ddl_concurrency)
         endif()
 
         # ── SHA-256 NIST vectors ──

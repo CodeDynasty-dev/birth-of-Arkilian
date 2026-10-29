@@ -3864,12 +3864,26 @@ sqlite3 *db_get_handle(arkilian *db) { return db ? db->handle : NULL; }
 // this, a table created outside db_exec is never captured (spec §1:
 // no write path may silently bypass capture). Never fatal — failures
 // are logged loudly and capture of other tables keeps working.
-static void apply_ddl_capture(arkilian *db, const char *sql) {
+// Callers run this inside the DDL's own write transaction (db_exec and
+// db_step wrap DDL in a savepoint), so the resync and the outbox insert
+// can never hit SQLITE_BUSY: the write lock is already held. Returns
+// SQLITE_OK when both the trigger resync and the outbox row succeeded.
+// On failure the DDL is still allowed to commit (application work is
+// never rolled back for backup reasons), but a durable capture gap is
+// recorded in the same transaction so health turns RED and no manifest
+// is published until a snapshot rebases the replica.
+static int apply_ddl_capture(arkilian *db, const char *sql) {
   char *terr = NULL;
+  int result = SQLITE_OK;
+  // The outbox insert below must not leak into the application's
+  // last_insert_rowid (DDL itself never changes it).
+  sqlite3_int64 saved_rowid = sqlite3_last_insert_rowid(db->handle);
   ARK_STORE(&db->trigger_sync_in_progress, 1);
   int sync_rc = sync_backup_triggers(db->handle, &terr);
   ARK_STORE(&db->trigger_sync_in_progress, 0);
   if (sync_rc != SQLITE_OK) {
+    result = sync_rc;
+    ARK_STORE(&db->triggers_dirty, 1);
     snprintf(db->last_error_msg, sizeof(db->last_error_msg),
              "backup trigger sync failed after DDL: %s", terr ? terr : "unknown error");
     ark_log(db, ARK_LOG_ERROR, "%s", db->last_error_msg);
@@ -3898,11 +3912,25 @@ static void apply_ddl_capture(arkilian *db, const char *sql) {
     int bind_rc = sqlite3_bind_text(ddl_stmt, 1, sql, -1, SQLITE_TRANSIENT);
     int step_rc = (bind_rc == SQLITE_OK) ? sqlite3_step(ddl_stmt) : bind_rc;
     if (step_rc != SQLITE_DONE) {
+      if (result == SQLITE_OK) result = step_rc;
       ark_log(db, ARK_LOG_ERROR,
               "DDL capture to _pending_backup failed (rc=%d): %s",
               step_rc, sqlite3_errmsg(db->handle));
     }
     sqlite3_finalize(ddl_stmt);
+  } else if (result == SQLITE_OK) {
+    result = sqlite3_errcode(db->handle);
+    if (result == SQLITE_OK) result = SQLITE_ERROR;
+  }
+  if (result != SQLITE_OK) {
+    // The replica cannot follow this schema change from the change log:
+    // open a capture gap so a snapshot rebases it.
+    sqlite3_exec(db->handle,
+                 "UPDATE _arkilian_meta SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT) "
+                 "WHERE k = 'capture_gap'; "
+                 "INSERT INTO _arkilian_meta (k, v) SELECT 'capture_gap', '1' "
+                 "WHERE NOT EXISTS (SELECT 1 FROM _arkilian_meta WHERE k = 'capture_gap');",
+                 NULL, NULL, NULL);
   }
   // Same exact-cap guard the capture triggers run (DDL rows are written
   // outside the triggers, so they must not skip a guard checkpoint).
@@ -3911,6 +3939,8 @@ static void apply_ddl_capture(arkilian *db, const char *sql) {
     outbox_guard_sql(g, sizeof(g));
     sqlite3_exec(db->handle, g, NULL, NULL, NULL);
   }
+  sqlite3_set_last_insert_rowid(db->handle, saved_rowid);
+  return result;
 }
 
 int db_exec(arkilian *db, const char *sql) {
@@ -4075,7 +4105,12 @@ int db_prepare(arkilian *db, const char *sql) {
   }
 
   sqlite3_stmt *stmt = NULL;
+  // The schema authorizer runs at PREPARE time, not step time: mark this
+  // as wrapped so DDL prepared here (and re-synced by db_step) is not
+  // reported as a raw-handle bypass.
+  ARK_STORE(&db->in_wrapped_dispatch, 1);
   int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
+  ARK_STORE(&db->in_wrapped_dispatch, 0);
   if (rc != SQLITE_OK) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s", sqlite3_errmsg(db->handle));
     return rc;
@@ -4137,16 +4172,50 @@ int db_step(arkilian *db) {
   int is_ddl = (db->stmt_is_ddl &&
                 db->stmt_current >= 0 && db->stmt_current < db->stmt_count &&
                 db->stmt_is_ddl[db->stmt_current]);
-  if (is_ddl) ARK_STORE(&db->in_wrapped_dispatch, 1);
+  if (!is_ddl) return sqlite3_step(stmt);
+
+  // DDL and its capture commit atomically, exactly as in db_exec. The
+  // savepoint makes the DDL's own step take the write lock, so the
+  // trigger resync and outbox insert that follow can never fail with
+  // SQLITE_BUSY. Previously the DDL autocommitted first; if the
+  // connection still had an open read (a half-consumed SELECT) and
+  // another connection committed in between, the resync's BEGIN
+  // IMMEDIATE and the outbox insert both failed with "database is
+  // locked" — the schema change committed but never reached the
+  // replica, and later rows were captured with the old column list.
+  int sp = sqlite3_exec(db->handle, "SAVEPOINT ark_ddl_capture;",
+                        NULL, NULL, NULL) == SQLITE_OK;
+  ARK_STORE(&db->in_wrapped_dispatch, 1);
   int rc = sqlite3_step(stmt);
-  if (is_ddl) ARK_STORE(&db->in_wrapped_dispatch, 0);
-  // DDL executed through prepare/step used to bypass trigger resync —
-  // a table created this way was never captured (spec §1). Resync once
-  // the statement completes successfully. The flag check is one
-  // load-free branch on the non-DDL hot path.
-  if (rc == SQLITE_DONE && is_ddl) {
+  ARK_STORE(&db->in_wrapped_dispatch, 0);
+  if (rc == SQLITE_DONE) {
     const char *raw = sqlite3_sql(stmt);
     apply_ddl_capture(db, raw ? raw : "");
+  }
+  if (sp) {
+    // A statement that is not reset keeps its error state, and SQLite
+    // then refuses to end the savepoint (RELEASE returns the same BUSY),
+    // leaving the connection inside an open transaction. A halted
+    // statement auto-resets on its next step anyway, so this changes
+    // nothing for the caller.
+    char msg[sizeof(db->last_error_msg)];
+    snprintf(msg, sizeof(msg), "%s", sqlite3_errmsg(db->handle));
+    sqlite3_reset(stmt);
+    if (rc == SQLITE_DONE) {
+      if (sqlite3_exec(db->handle, "RELEASE ark_ddl_capture;",
+                       NULL, NULL, NULL) != SQLITE_OK) {
+        rc = sqlite3_extended_errcode(db->handle);
+        snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+                 sqlite3_errmsg(db->handle));
+        sqlite3_exec(db->handle, "ROLLBACK TO ark_ddl_capture;", NULL, NULL, NULL);
+        sqlite3_exec(db->handle, "RELEASE ark_ddl_capture;", NULL, NULL, NULL);
+      }
+    } else {
+      // Keep the step's error for the caller; undo the empty savepoint.
+      sqlite3_exec(db->handle, "ROLLBACK TO ark_ddl_capture;", NULL, NULL, NULL);
+      sqlite3_exec(db->handle, "RELEASE ark_ddl_capture;", NULL, NULL, NULL);
+      snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s", msg);
+    }
   }
   return rc;
 }
