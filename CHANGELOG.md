@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.6.1 — DDL capture fix
+
+### Fixed
+
+- **DDL through `prepare`/`step` (Node `run()`) could commit without being
+  captured.** When the connection still had a statement open and another
+  connection (the flush thread, a second process) committed in between, the
+  trigger resync and the outbox insert after the DDL both failed with
+  `database is locked`: the replica never got the schema change and later rows
+  of that table were captured with the old column list. DDL through `db_step`
+  now runs with its capture in one savepoint, as `db_exec` already did, so the
+  capture holds the write lock and cannot be refused. A DDL that cannot get the
+  write lock fails as a whole and can be retried. If a resync fails for any
+  other reason a capture gap is recorded (health RED, snapshot rebase) instead
+  of logging and carrying on. Covered by `tests/test_ddl_concurrency.c`.
+- DDL prepared through the wrapper no longer logs the raw-handle "schema change
+  bypassed the backup wrapper" warning (the authorizer runs at prepare time),
+  and capturing DDL no longer changes the application's `last_insert_rowid`.
+- Node `all(sql, params, maxRows)` returned an error ("another row available")
+  whenever the result had more rows than `maxRows`; it now returns the first
+  `maxRows` rows.
+
 ## 1.6.0 — replication correctness release
 
 Every fix below closes a defect that was reproduced against 1.5.0 and is now
@@ -49,23 +71,6 @@ covered by `tests/test_p0_replication.c` (or an updated existing suite).
   flush thread cleared the outbox-full flag at 90% while the guard raised it
   lower, so it could undo a fresh raise. The clear point is now derived from
   the guard's headroom (capture was never lost; only the cap overshot).
-- **DDL through `prepare`/`step` (Node `run()`) could commit without being
-  captured.** When the connection still had a statement open and another
-  connection (the flush thread, a second process) committed in between, the
-  trigger resync and the outbox insert after the DDL both failed with
-  `database is locked`: the replica never got the schema change and later rows
-  of that table were captured with the old column list. DDL through `db_step`
-  now runs with its capture in one savepoint, as `db_exec` already did, so the
-  capture holds the write lock and cannot be refused. A DDL that cannot get the
-  write lock fails as a whole and can be retried. If a resync fails for any
-  other reason a capture gap is recorded (health RED, snapshot rebase) instead
-  of logging and carrying on. Covered by `tests/test_ddl_concurrency.c`.
-- DDL prepared through the wrapper no longer logs the raw-handle "schema change
-  bypassed the backup wrapper" warning (the authorizer runs at prepare time),
-  and capturing DDL no longer changes the application's `last_insert_rowid`.
-- Node `all(sql, params, maxRows)` returned an error ("another row available")
-  whenever the result had more rows than `maxRows`; it now returns the first
-  `maxRows` rows.
 - Shipping waits for the startup manifest read, so adopted and new chunk
   records stay in LSN order; an endpoint refused by the SSRF guard is reported
   at startup.
