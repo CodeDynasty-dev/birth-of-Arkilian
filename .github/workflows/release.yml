@@ -467,11 +467,6 @@ jobs:
         path: dist-npm/
         if-no-files-found: error
 
-    - name: Publish to npm (if NPM_TOKEN set)
-      if: env.NODE_AUTH_TOKEN != ''
-      run: npm publish --access public
-      env:
-        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ── Drop All Release Artifacts to GitHub Release ────────────────────
   drop_release_artifacts:
@@ -545,8 +540,57 @@ jobs:
 
         echo "Attaching release artifacts to $TAG..."
         gh release upload "$TAG" final-artifacts/* --clobber
+
+        # release-drafter keeps a DRAFT named after the next version. When
+        # that name matches this tag, `gh release view` above finds the
+        # draft, so the assets land in it; publish it so it becomes the
+        # real release. Without this, the provenance job could not see the
+        # draft and created a second, public release with only the
+        # provenance file (what happened to v1.6.1).
+        gh release edit "$TAG" --tag "$TAG" --draft=false --latest
         echo "Release artifacts dropped successfully!"
         gh release view "$TAG"
+
+  # ── Publish to the npm registry ──────────────────────────────────────
+  # Runs only after the GitHub release holds its assets: `npm install`
+  # downloads arkilian-node-prebuilds-v<version>.tar.gz from the release,
+  # so publishing earlier makes installs fall back to a source build.
+  # Skipped (with a notice) when the NPM_TOKEN secret is not set.
+  publish_npm_registry:
+    needs: [resolve_tag, drop_release_artifacts]
+    runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+    - name: NPM_TOKEN not set
+      if: env.NPM_TOKEN == ''
+      run: echo "::notice::NPM_TOKEN secret is not set; skipping npm publish (run npm publish manually)."
+
+    - uses: actions/checkout@v4
+      if: env.NPM_TOKEN != ''
+      with:
+        ref: ${{ github.event.release.tag_name || github.ref }}
+
+    - name: Setup Node
+      if: env.NPM_TOKEN != ''
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        registry-url: 'https://registry.npmjs.org'
+
+    - name: Check the prebuilds asset is downloadable
+      if: env.NPM_TOKEN != ''
+      run: |
+        VERSION="${{ needs.resolve_tag.outputs.version }}"
+        URL="https://github.com/${{ github.repository }}/releases/download/${{ needs.resolve_tag.outputs.tag }}/arkilian-node-prebuilds-v${VERSION}.tar.gz"
+        curl -fsIL "$URL" >/dev/null || { echo "::error::$URL is not downloadable"; exit 1; }
+        test "$(node -p "require('./package.json').version")" = "$VERSION"
+
+    - name: Publish to npm
+      if: env.NPM_TOKEN != ''
+      run: npm publish --access public
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ── SLSA Provenance Attestation ─────────────────────────────────────
   provenance:
